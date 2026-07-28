@@ -1,0 +1,41 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "job-watcher-trigger",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-28",
+
+  // GitHub's schedule queue drops the large majority of ticks for this repo
+  // (5 runs landed in the first 15 hours of a "*/15" cron, averaging one every
+  // ~2.6 hours). Cloudflare's scheduler is punctual, so the cron lives here and
+  // watch-jobs.yml is dispatched over the API instead.
+  "triggers": {
+    "crons": ["*/30 * * * *"]
+  },
+
+  // Cron is the only trigger this Worker needs, so it gets no public URL at
+  // all. The fetch handler in src/index.js still serves `wrangler dev` for
+  // local testing; flip these to true if you ever want the manual
+  // POST /trigger endpoint reachable from the internet.
+  "workers_dev": false,
+  "preview_urls": false,
+
+  // 48 invocations a day -- no reason to sample anything out.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  "vars": {
+    "GITHUB_OWNER": "youssufhelaly",
+    "GITHUB_REPO": "job-watcher",
+    // Referenced by filename rather than numeric id: the id changes if the
+    // workflow file is ever deleted and re-added, the filename doesn't.
+    "GITHUB_WORKFLOW": "watch-jobs.yml",
+    "GITHUB_REF": "main"
+  }
+
+  // Secrets are NOT set here -- they would be committed. Set them with:
+  //   npx wrangler secret put GITHUB_TOKEN         (required)
+  //   npx wrangler secret put DISCORD_WEBHOOK_URL  (optional, failure alerts)
+  //   npx wrangler secret put TRIGGER_SECRET       (optional, manual dispatch)
+}

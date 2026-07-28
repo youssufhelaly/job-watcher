@@ -22,6 +22,10 @@ Notifications go to a Discord channel via webhook, set through the
 DISCORD_WEBHOOK_URL environment variable. If it isn't set, the script
 prints what it would have sent instead (dry run), which is handy for
 testing without spamming the channel.
+
+DISCORD_BOT_TOKEN is optional and does one thing: pre-place the triage
+emoji on each card, which a webhook is not allowed to do. Postings
+deliver normally without it.
 """
 
 import os
@@ -30,7 +34,7 @@ import json
 import base64
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, quote
 from pathlib import Path
 
 import requests
@@ -428,12 +432,38 @@ def migrate_ledger(ledger: dict) -> tuple[dict, int]:
 # because a 200-row false positive is noise nobody triages anyway.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# With no webhook configured there is nowhere to deliver, so the run only
-# prints what it would have sent and persists nothing. Writing state in
-# that mode would mark postings as notified that nobody ever received.
-DRY_RUN = not DISCORD_WEBHOOK
-
 EMBEDS_PER_MESSAGE = 1
+
+# Triage reactions, pre-placed on each card so marking a posting is one
+# click instead of a trip through the emoji picker.
+#
+# A webhook cannot react to its own message -- only a bot can add a
+# reaction -- so this needs DISCORD_BOT_TOKEN (a bot in the server with
+# View Channel + Read Message History + Add Reactions). It is OPTIONAL:
+# without it everything still posts, you just add the emoji yourself.
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+TRIAGE_EMOJI = ["✅", "❌", "\U0001F516"]   # applied / no / shortlist
+DISCORD_API = "https://discord.com/api/v10"
+
+# Cards go out as the bot rather than through the webhook when a channel
+# id is configured, because a webhook created in the channel-settings UI
+# is not allowed to attach components -- and the Apply button IS a
+# component. Needs Send Messages + Embed Links on top of the reaction
+# permissions above.
+#
+# The button is a LINK button (style 5). Discord opens the URL itself and
+# never calls back, so this stays a plain outbound script -- no endpoint,
+# no signature checking, nothing to host. Buttons that report a click
+# back (Applied / Saved) are a different thing entirely and would need
+# all of that.
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
+POST_AS_BOT = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)
+BUTTON_STYLE_LINK = 5
+
+# Nowhere to deliver means the run only prints what it would have sent
+# and persists nothing. Writing state in that mode would mark postings as
+# notified that nobody ever received.
+DRY_RUN = not (DISCORD_WEBHOOK or POST_AS_BOT)
 DISCORD_COLORS = {
     "SimplifyJobs/Summer2026-Internships": 0x5865F2,   # blurple
     "vanshb03/Summer2027-Internships": 0x57F287,       # green
@@ -453,22 +483,57 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
 
 
-def _post_discord(payload: dict) -> bool:
-    """POST to the webhook, honouring 429 rate-limit backoff."""
-    if not DISCORD_WEBHOOK:
+def _webhook_url(want_message: bool) -> str:
+    """The webhook URL, with wait=true when the caller needs the message.
+
+    Discord returns 204 No Content by default; wait=true makes it return
+    the created message, which is the only way to learn the message id
+    that reactions have to be attached to. Built with urlencode rather
+    than string concatenation because the configured URL may already
+    carry a query string (e.g. ?thread_id=...).
+    """
+    if not want_message:
+        return DISCORD_WEBHOOK
+    parts = urlparse(DISCORD_WEBHOOK)
+    query = parse_qs(parts.query)
+    query["wait"] = ["true"]
+    return parts._replace(query=urlencode(query, doseq=True)).geturl()
+
+
+def _post_discord(payload: dict, want_message: bool = False) -> dict | None:
+    """Send one message, as the bot when configured, else via webhook.
+
+    Returns the created message on success (an empty dict when Discord
+    sent no body), or None on failure. Callers must test `is not None`
+    -- a successful post with no body is an empty, falsy dict.
+    """
+    if DRY_RUN:
         print(f"[DRY RUN discord] {json.dumps(payload)[:1500]}")
-        return True
+        return {}
+
+    if POST_AS_BOT:
+        url = f"{DISCORD_API}/channels/{DISCORD_CHANNEL_ID}/messages"
+        headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    else:
+        # Components are rejected on a UI-created webhook, so drop the
+        # button rather than lose the whole card to a 400.
+        payload = {k: v for k, v in payload.items() if k != "components"}
+        url = _webhook_url(want_message)
+        headers = None
 
     for attempt in range(1, 6):
         try:
-            resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=20)
+            resp = requests.post(url, json=payload, headers=headers, timeout=20)
         except requests.RequestException as e:
             print(f"Discord request error (attempt {attempt}): {e}")
             time.sleep(2 * attempt)
             continue
 
         if resp.status_code in (200, 204):
-            return True
+            try:
+                return resp.json() if resp.content else {}
+            except ValueError:
+                return {}
 
         if resp.status_code == 429:
             # Discord tells us exactly how long to wait; respect it.
@@ -482,14 +547,86 @@ def _post_discord(payload: dict) -> bool:
 
         print(f"Discord returned {resp.status_code}: {resp.text[:300]}")
         if 400 <= resp.status_code < 500:
-            return False   # malformed payload; retrying won't help
+            return None   # malformed payload; retrying won't help
         time.sleep(2 * attempt)
 
     print("Discord: giving up after repeated failures.")
-    return False
+    return None
 
 
-def build_job_embed(repo: str, row: dict, label: str | None = None) -> dict:
+def _add_triage_reactions(message: dict) -> None:
+    """Pre-place the triage emoji on a posted card.
+
+    Best effort by design. The card is already delivered by the time this
+    runs, so a failure here must NOT bubble up -- treating it as a failed
+    delivery would leave the posting out of the ledger and re-post it on
+    the next run. A missing emoji you can add by hand; a duplicate card
+    is noise in the feed.
+    """
+    if not (DISCORD_BOT_TOKEN and message.get("id") and message.get("channel_id")):
+        return
+
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    base = (f"{DISCORD_API}/channels/{message['channel_id']}"
+            f"/messages/{message['id']}/reactions")
+
+    for emoji in TRIAGE_EMOJI:
+        # safe="" so the emoji is fully percent-encoded into the path.
+        url = f"{base}/{quote(emoji, safe='')}/@me"
+        for attempt in range(1, 4):
+            try:
+                resp = requests.put(url, headers=headers, timeout=20)
+            except requests.RequestException as e:
+                print(f"Reaction request error ({emoji}): {e}")
+                break
+
+            if resp.status_code in (200, 204):
+                break
+            if resp.status_code == 429:
+                try:
+                    wait = float(resp.json().get("retry_after", 1))
+                except (ValueError, KeyError, TypeError):
+                    wait = 1.0
+                time.sleep(wait + 0.25)
+                continue
+
+            print(f"Reaction {emoji} failed: {resp.status_code} {resp.text[:200]}")
+            break
+
+        # Reaction endpoints are rate limited per channel and more
+        # tightly than message sends, so pace them deliberately.
+        time.sleep(0.3)
+
+
+def build_apply_button(row: dict) -> list | None:
+    """An action row holding one link button, or None if there's no link.
+
+    Discord rejects a link button whose url isn't http(s), and some rows
+    carry no application link at all -- both cases just get a card with
+    no button rather than a failed send.
+    """
+    link = (row.get("link") or "").strip()
+    if not link.startswith(("http://", "https://")):
+        return None
+    return [{
+        "type": 1,                       # action row
+        "components": [{
+            "type": 2,                   # button
+            "style": BUTTON_STYLE_LINK,
+            "label": "Apply",
+            "url": link,
+        }],
+    }]
+
+
+def build_job_embed(repo: str, row: dict, label: str | None = None,
+                    apply_field: bool | None = None) -> dict:
+    # With a real Apply button on the message, the Apply field inside the
+    # embed is the same link twice. Checked at call time, not bound as a
+    # default, so tests can flip the transport.
+    if apply_field is None:
+        apply_field = not POST_AS_BOT
+
     cells = row["cells"]
     company = cells[0] if cells else "Unknown"
     role = cells[1] if len(cells) > 1 else "New posting"
@@ -511,7 +648,7 @@ def build_job_embed(repo: str, row: dict, label: str | None = None) -> dict:
         embed["fields"].append({"name": "Location", "value": _clip(cells[2], MAX_FIELD_VALUE), "inline": True})
     if len(cells) > 3 and cells[3] and ("$" in cells[3] or "/hr" in cells[3].lower()):
         embed["fields"].append({"name": "Pay", "value": _clip(cells[3], MAX_FIELD_VALUE), "inline": True})
-    if row.get("link"):
+    if apply_field and row.get("link"):
         embed["fields"].append({"name": "Apply", "value": _clip(f"[Open posting]({row['link']})", MAX_FIELD_VALUE), "inline": True})
 
     return embed
@@ -531,12 +668,22 @@ def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
         payload = {"embeds": [
             build_job_embed(item["repo"], item["row"], item.get("label")) for item in batch
         ]}
+        # One posting per message is what makes a single Apply button
+        # unambiguous; _post_discord strips components on the webhook
+        # transport, which cannot carry them.
+        if len(batch) == 1:
+            components = build_apply_button(batch[0]["row"])
+            if components:
+                payload["components"] = components
         if i == 0:
             n = len(pending)
             payload["content"] = _clip(f"**{n} new posting{'s' if n != 1 else ''}**", MAX_CONTENT)
 
-        if _post_discord(payload):
+        # want_message: the reactions need the id of the card just posted.
+        message = _post_discord(payload, want_message=bool(DISCORD_BOT_TOKEN))
+        if message is not None:
             delivered.extend(batch)
+            _add_triage_reactions(message)
         else:
             print(f"Batch of {len(batch)} posting(s) failed to send; they will be retried next run.")
         # Stay comfortably under the webhook rate limit between batches.
@@ -586,7 +733,9 @@ def send_compact_list(pending: list[dict], reason: str) -> list[dict]:
         if not chunk:
             return
         body = "\n".join(_compact_line(item) for item in chunk)
-        if _post_discord({"embeds": [{"description": body, "color": 0x99AAB5}]}):
+        # No triage emoji on the flood path: one message carries many
+        # postings there, so a reaction on it wouldn't mean anything.
+        if _post_discord({"embeds": [{"description": body, "color": 0x99AAB5}]}) is not None:
             delivered.extend(chunk)
         else:
             print(f"Compact chunk of {len(chunk)} posting(s) failed to send; they will be retried next run.")

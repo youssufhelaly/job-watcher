@@ -30,8 +30,9 @@ within seconds:
 
 ## How it works
 
-- `check_jobs.py` runs every 15 minutes (via GitHub Actions, so nothing
-  runs on your own machine). It fetches each repo's README, compares it to
+- `check_jobs.py` runs every 30 minutes on GitHub Actions, so nothing runs
+  on your own machine. The clock lives in a small Cloudflare Worker rather
+  than a GitHub `cron:` — see [Scheduling](#scheduling) for why. It fetches each repo's README, compares it to
   the version saved from the last run, and finds rows that are
   genuinely new — using each posting's real application link as its
   identity, not its position in the file. That matters because these
@@ -60,6 +61,11 @@ Three channels. Postings land in the feed; you route each one out of it.
 | `#shortlist` | the work queue — jobs you mean to apply to, not yet done |
 | `#applied` | the record — jobs you've sent |
 
+Each card arrives with an **Apply** button and ✅ ❌ 🔖 already on it, so
+both applying and marking are one click. Those need a bot — see
+[Bot setup](#bot-setup-optional) — and without one everything still
+works, with the apply link inside the card and no emoji.
+
 **From the feed**, every posting gets one of three moves:
 
 | Decision | Do this |
@@ -78,12 +84,57 @@ to `#applied`, delete it from `#shortlist`. It's gone from the queue and
 still on the record. A channel that only holds unprocessed work is the
 whole trick — deleting is dequeuing, and Discord already does the rest.
 
-### Why this and not a bot
+### Bot setup (optional)
 
-Buttons that write to a real pipeline database are buildable — a Discord
-app plus a Cloudflare Worker on the interactions endpoint, no always-on
-process needed. The difference is clicks, not capability: one button
-instead of a forward and a react.
+Two things a webhook is not allowed to do: react to its own message, and
+attach a button. Both need a bot. Note what this bot does *not* do —
+there's no server to host, no database, and nothing running between
+checks. It makes outbound calls during the Actions run and that's all.
+
+1. [Discord Developer Portal](https://discord.com/developers/applications)
+   → **New Application** → **Bot** → **Reset Token**, copy it.
+2. **OAuth2 → URL Generator**: scope `bot`, permissions **View
+   Channel**, **Send Messages**, **Embed Links**, **Read Message
+   History**, **Add Reactions**. Open the generated URL and add it to
+   your server.
+3. Right-click your feed channel → **Copy Channel ID** (needs Developer
+   Mode on, under Settings → Advanced).
+4. Repo **Settings → Secrets and variables → Actions** → two new
+   secrets, `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID`.
+
+The two secrets do different things, and setting only the token is a
+valid halfway state:
+
+| Configured | What you get |
+|---|---|
+| neither | webhook posts the card, apply link inside it, no emoji |
+| token only | same card, plus ✅ ❌ 🔖 pre-placed |
+| token + channel id | bot posts the card, Apply button, emoji |
+
+The Apply button is why the channel id matters. Buttons are components,
+components require a bot-authored message, and a bot posts to a channel
+rather than to a webhook URL. With both set, `DISCORD_WEBHOOK_URL` is no
+longer used for job cards — keep it, since `daily_digest.py` still uses
+it.
+
+The bot's own reaction is why each emoji shows a count of 1 — yours makes
+it 2. Reactions cost three API calls per posting, paced to stay under
+Discord's per-channel reaction limit, so a run with many new postings
+takes a bit longer to finish delivering.
+
+A card with no application link gets no button, and a failed reaction
+still counts the posting as delivered. Both are deliberate: re-sending a
+card you already received is worse than a missing button or an emoji you
+add by hand.
+
+### Why this and not buttons
+
+Real buttons that write to a pipeline database are buildable — the same
+Discord app, plus a Cloudflare Worker on its interactions endpoint to
+answer clicks within Discord's 3-second window, and a small D1 table for
+status. Still no always-on process, but it is a service you own and it
+fails silently when it's down. The difference in daily use is clicks,
+not capability: one button instead of a forward and a react.
 
 But every tracker dies the same way, which is that you stop updating it.
 So this runs first, with nothing to deploy and nothing to maintain.
@@ -107,17 +158,16 @@ It's tighter filtering upstream in `check_jobs.py`.
 Add all the files from this bundle, keeping the `.github/workflows/`
 folder structure intact.
 
-**Public matters at 15-minute polling.** GitHub Actions is unmetered on
+**Public matters at this polling rate.** GitHub Actions is unmetered on
 public repos, but private repos on the Free plan get 2,000 Linux
 minutes/month and billing rounds up to a whole minute per run. Polling
-every 15 minutes is 2,880 runs/month, so a private repo would exhaust
-the free tier around day 20 and then just stop running.
+every 30 minutes is ~1,440 runs/month, which fits — but only just, and
+only if each run stays under about a minute. On a public repo it's free
+and you never have to think about it.
 
 Nothing sensitive lives in the repo — the state files only contain
 public job listings, and the Discord webhook goes in GitHub Secrets,
-which stays private even on a public repo. If you'd rather keep it
-private anyway, change the cron to `*/30 * * * *` (~1,440 runs/month)
-to stay inside the free allowance.
+which stays private even on a public repo.
 
 ### 2. Sources are already configured
 Internships and co-ops only — no new-grad roles. Several of these repos
@@ -188,6 +238,85 @@ Two format quirks, both handled automatically:
 - To verify Discord is wired up, delete a few lines from any file in `state/` (and remove the matching entries from `state/notified.json`), commit, then re-run the workflow — those postings should appear in your channel within a minute.
 - The daily rundown is a separate workflow on its own schedule (default 9am Eastern) — edit the `cron:` line in `.github/workflows/daily-digest.yml` for your preferred time.
 
+### 5. Deploy the scheduler
+
+`watch-jobs.yml` has no `cron:` — it only runs when something dispatches it.
+The Worker in [`worker/`](worker/) is what does that, every 30 minutes.
+See [Scheduling](#scheduling) below for why, then:
+
+1. **Mint a token.** GitHub → Settings → Developer settings → **Fine-grained
+   tokens** → Generate new token. Repository access: **only this repo**.
+   Permissions: **Actions → Read and write**, nothing else. Copy it.
+2. **Deploy.**
+   ```bash
+   cd worker
+   npx wrangler login
+   npx wrangler secret put GITHUB_TOKEN         # paste the PAT
+   npx wrangler secret put DISCORD_WEBHOOK_URL  # same URL as the Actions secret
+   npx wrangler deploy
+   ```
+3. **Verify.** Within 30 minutes a run should appear in the Actions tab with
+   `workflow_dispatch` as its trigger. `npx wrangler tail` shows each
+   dispatch live if you don't want to wait.
+
+`DISCORD_WEBHOOK_URL` is optional but strongly recommended — it's how the
+Worker tells you the token died instead of failing silently. Edit the
+`crons` line in `worker/wrangler.jsonc` and redeploy to change the cadence.
+
+The Worker has **no public URL** — `workers_dev` and `preview_urls` are both
+off, because a cron trigger is the only thing it needs.
+
+**On a brand-new Cloudflare account, do this before the first deploy:** open
+[dash.cloudflare.com](https://dash.cloudflare.com) → **Compute (Workers)** once.
+Loading that page creates your account's `workers.dev` subdomain. Cloudflare
+won't register *any* trigger without one — including crons, and including when
+`workers_dev` is `false` — and the deploy fails with
+`Some triggers failed to deploy` / API error **10063**. The script uploads
+successfully, so it looks half-broken: no schedule, no error on the code
+itself. The subdomain is account-level and shared by every Worker you deploy;
+creating it doesn't expose this one.
+
+One gotcha worth stating plainly, since it's easy to get backwards:
+`wrangler secret put NAME` takes the secret's **name** as the argument and
+reads the **value** from the prompt that follows. Passing the value as the
+argument creates a secret named after your credential — and names are not
+masked in the dashboard, the CLI, or shell history. `npm test` in `worker/` exercises the dispatch logic against a
+mocked GitHub API — 30 checks, no network or credentials needed.
+
+## Scheduling
+
+**GitHub's `schedule:` events were unusable for this.** With a `*/15` cron,
+five scheduled runs landed in the first fifteen hours — one every ~2.6 hours
+on average, against an expected sixty. That's documented behavior, not a
+misconfiguration: schedule events are the lowest priority on the shared
+runner pool, high-frequency crons get throttled hardest, and dropped ticks
+are never retried. A watcher meant to catch postings early can't sit behind a
+2.6-hour queue.
+
+`workflow_dispatch` isn't throttled that way, so the schedule moved off
+GitHub. `worker/src/index.js` is a Cloudflare Worker on a `*/30` cron trigger
+that POSTs to the dispatch API, retries transient failures, and posts to
+Discord if the token expires or loses its permissions. Free tier: 48 requests
+a day against a 100,000/day allowance.
+
+The trade is one long-lived credential outside GitHub. It's a fine-grained
+PAT limited to this repo with `Actions: read and write` and nothing else, held
+in Cloudflare's secret store (write-only once set, not readable from the
+dashboard). Worst case is revoke and reissue.
+
+**Rotating the token** — do this before the expiry you chose, or right away
+if it leaks:
+
+```bash
+cd worker && npx wrangler secret put GITHUB_TOKEN   # paste the new PAT
+```
+
+No redeploy needed. Then delete the old token on GitHub.
+
+**The daily digest still uses a GitHub `cron:`.** Once-a-day timing tolerates
+hours of slop, and it has fired on schedule, so it isn't worth a second
+trigger.
+
 ## Duplicates vs missed postings
 
 The system is deliberately biased toward **showing you a posting twice
@@ -256,13 +385,17 @@ postings already live across your four repos. Alerts start next run.
 
 ## A couple of honest caveats
 
-- GitHub's scheduled runs can be delayed several minutes under load,
-  especially on the busy `*/15` schedule — treat 15 minutes as a target,
-  not a guarantee. Runs are queued (not cancelled) if one overlaps the
-  next, so nothing is skipped.
-- GitHub auto-disables scheduled workflows after 60 days of *zero
-  repo activity* — but since this workflow commits state back every
-  run, that resets the clock automatically, so it won't happen here.
+- **The 30-minute cadence depends on the Worker being deployed.** If you
+  skip [step 5](#5-deploy-the-scheduler), `watch-jobs.yml` has no trigger at
+  all and will only ever run when you click "Run workflow". This is the
+  deliberate trade for punctuality — see [Scheduling](#scheduling). Runs are
+  queued (not cancelled) if one overlaps the next, so nothing is skipped.
+- **The PAT expires.** When it does, the Worker starts getting 401s and
+  alerts your Discord channel, but no postings are checked until you rotate
+  it. Set a calendar reminder for a week before the expiry you chose.
+- GitHub auto-disables *scheduled* workflows after 60 days of zero repo
+  activity. Doesn't apply to `watch-jobs.yml` (no schedule), and the daily
+  digest is kept alive by the state commits every run.
 - Anyone holding the Discord webhook URL can post to that channel.
   Keep it in GitHub Secrets; if it ever leaks, delete the webhook in
   Discord and create a new one.

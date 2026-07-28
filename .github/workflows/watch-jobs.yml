@@ -1,9 +1,12 @@
 name: Watch for new internship postings
 
+# Deliberately dispatch-only. GitHub's `schedule:` queue throttled this repo
+# to roughly one run every 2.6 hours despite a "*/15" cron, which is useless
+# for catching new postings early. The 30-minute cadence now comes from the
+# Cloudflare Worker in worker/, which calls the workflow_dispatch API.
+# See "Scheduling" in the README.
 on:
-  schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
-  workflow_dispatch: {}     # lets you trigger a manual test run from the Actions tab
+  workflow_dispatch: {}
 
 permissions:
   contents: write   # needed so the workflow can commit the updated snapshot state
@@ -32,6 +35,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Optional pair. The token alone pre-places the triage emoji.
+          # Token + channel id also switches posting from the webhook to
+          # the bot, which is what allows the Apply button. Postings
+          # deliver normally with neither set.
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
         run: python check_jobs.py
 
       - name: Save updated snapshot state

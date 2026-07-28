@@ -1,0 +1,15 @@
+{
+  "name": "job-watcher-trigger",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker that dispatches the job-watcher Actions workflow on a punctual schedule.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "dev": "wrangler dev --test-scheduled",
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.115.0"
+  }
+}
