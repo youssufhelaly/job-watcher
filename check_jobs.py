@@ -39,12 +39,60 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # 1. CONFIG -- replace with your four repos, "owner/repo" format
 # ---------------------------------------------------------------------------
-REPOS = [
-    "SimplifyJobs/Summer2026-Internships",
-    "vanshb03/Summer2027-Internships",
-    "speedyapply/2027-SWE-College-Jobs",
-    "speedyapply/2027-AI-College-Jobs",
+# Each entry is (owner/repo, file). Several of these repos keep more than
+# one list -- speedyapply splits USA/International and Internship/New-Grad
+# across four separate files, and only the README is linked as the "main"
+# one. Watching just the README there would miss roughly 85% of the repo.
+# Each entry is (owner/repo, file, filter).
+#
+#   "all"        -- take every row in the file
+#   "intern_coop"-- take only rows whose role reads as an internship or
+#                   co-op. Used on the new-grad lists, which are mostly
+#                   full-time graduate roles you don't want, but which
+#                   do contain the occasional stray co-op.
+#
+# Several of these repos keep more than one list: speedyapply splits
+# USA/International and Internship/New-Grad across four files, and only
+# the README is linked as the "main" one. Watching just the README there
+# would miss roughly 85% of the repo.
+SOURCES = [
+    ("SimplifyJobs/Summer2026-Internships", "README.md",       "all"),
+    ("vanshb03/Summer2027-Internships",     "README.md",       "all"),
+
+    ("speedyapply/2027-SWE-College-Jobs",   "README.md",       "all"),
+    ("speedyapply/2027-SWE-College-Jobs",   "INTERN_INTL.md",  "all"),
+    ("speedyapply/2027-AI-College-Jobs",    "README.md",       "all"),
+    ("speedyapply/2027-AI-College-Jobs",    "INTERN_INTL.md",  "all"),
+
+    # New-grad lists: scanned, but only intern/co-op rows are kept. A
+    # handful of co-ops get filed here by mistake and would otherwise be
+    # missed entirely.
+    ("speedyapply/2027-SWE-College-Jobs",   "NEW_GRAD_USA.md",  "intern_coop"),
+    ("speedyapply/2027-SWE-College-Jobs",   "NEW_GRAD_INTL.md", "intern_coop"),
+    ("speedyapply/2027-AI-College-Jobs",    "NEW_GRAD_USA.md",  "intern_coop"),
+    ("speedyapply/2027-AI-College-Jobs",    "NEW_GRAD_INTL.md", "intern_coop"),
 ]
+
+# Matches "Intern", "Internship", "Co-op", "Coop", "Co op", "Co-op_Spring"
+# -- but NOT "internal". Plain \b fails here because an underscore counts
+# as a word character, so "Co-op_Spring 2027" wouldn't match; the explicit
+# lookarounds treat anything non-alphanumeric as a boundary.
+INTERN_COOP_RE = re.compile(
+    r"(?<![a-z0-9])(intern(ship|s)?|co[-\s_]?ops?)(?![a-z0-9])", re.I
+)
+
+
+def keep_row(row: dict, mode: str) -> bool:
+    if mode == "all":
+        return True
+    cells = row.get("cells") or []
+    role = cells[1] if len(cells) > 1 else ""
+    return bool(INTERN_COOP_RE.search(role))
+
+
+# Used for ledger-migration detection and nothing else.
+REPOS = sorted({repo for repo, _, _ in SOURCES})
+
 
 STATE_DIR = Path("state")
 LOG_FILE = STATE_DIR / "new_jobs_log.jsonl"
@@ -67,21 +115,34 @@ HEADER_WORDS = {
 # ---------------------------------------------------------------------------
 # 2. Fetch README content for a repo (works regardless of default branch)
 # ---------------------------------------------------------------------------
-def fetch_readme(owner_repo: str) -> str:
+def source_id(repo: str, path: str) -> str:
+    """Stable label for a (repo, file) pair, e.g. 2027-SWE-College-Jobs/INTERN_INTL."""
+    stem = path.rsplit(".", 1)[0]
+    short = repo.split("/")[-1]
+    return short if stem.upper() == "README" else f"{short}/{stem}"
+
+
+def fetch_file(owner_repo: str, path: str) -> str:
+    """Fetch one file from a repo, trying the API first then the raw CDN."""
     headers = {"Accept": "application/vnd.github.raw+json"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     try:
-        resp = requests.get(f"{GITHUB_API}/repos/{owner_repo}/readme", headers=headers, timeout=30)
+        resp = requests.get(
+            f"{GITHUB_API}/repos/{owner_repo}/contents/{path}", headers=headers, timeout=30
+        )
         resp.raise_for_status()
-        if resp.headers.get("Content-Type", "").startswith("text/") or resp.text.lstrip().startswith(("#", "<", "!", "[")):
-            return resp.text
+        text = resp.text
+        if text.lstrip().startswith(("#", "<", "!", "[", "|")):
+            return text
         data = resp.json()
         return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
     except Exception:
-        # Fallback for local testing without a token / API hiccups: try the CDN directly.
+        # Unauthenticated API calls get rate limited fast; the CDN doesn't.
         for branch in ("main", "master"):
-            r = requests.get(f"https://raw.githubusercontent.com/{owner_repo}/{branch}/README.md", timeout=30)
+            r = requests.get(
+                f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{path}", timeout=30
+            )
             if r.status_code == 200:
                 return r.text
         raise
@@ -209,16 +270,22 @@ def extract_rows(text: str) -> list[dict]:
     return _disambiguate_keys(rows)
 
 
-def find_new_rows(repo: str, old_text: str, new_text: str) -> list[dict]:
+def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all") -> list[dict]:
     """Rows present now that weren't in the previous snapshot.
 
     Compares using ledger_key -- the SAME identity the ledger uses. If
     this compared on the raw URL instead, a new role appearing behind an
     evergreen careers page would never become a candidate and would be
     silently missed, regardless of what the ledger thinks.
+
+    The filter is applied to BOTH sides, so a row that the filter
+    excludes can never register as an addition or a removal.
     """
-    old_keys = {ledger_key(repo, r) for r in extract_rows(old_text)}
-    return [r for r in extract_rows(new_text) if ledger_key(repo, r) not in old_keys]
+    old_keys = {ledger_key(repo, r) for r in extract_rows(old_text) if keep_row(r, mode)}
+    return [
+        r for r in extract_rows(new_text)
+        if keep_row(r, mode) and ledger_key(repo, r) not in old_keys
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +462,7 @@ def _post_discord(payload: dict) -> bool:
     return False
 
 
-def build_job_embed(repo: str, row: dict) -> dict:
+def build_job_embed(repo: str, row: dict, label: str | None = None) -> dict:
     cells = row["cells"]
     company = cells[0] if cells else "Unknown"
     role = cells[1] if len(cells) > 1 else "New posting"
@@ -403,7 +470,7 @@ def build_job_embed(repo: str, row: dict) -> dict:
     embed = {
         "title": _clip(f"{company} \u2014 {role}", MAX_EMBED_TITLE),
         "color": DISCORD_COLORS.get(repo, 0x99AAB5),
-        "footer": {"text": repo.split("/")[-1]},
+        "footer": {"text": label or repo.split("/")[-1]},
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
     }
@@ -425,7 +492,7 @@ def build_job_embed(repo: str, row: dict) -> dict:
 
 def send_jobs_to_discord(pending: list[dict]) -> bool:
     """Post every new job as a Discord embed, batched to respect limits."""
-    embeds = [build_job_embed(item["repo"], item["row"]) for item in pending]
+    embeds = [build_job_embed(item["repo"], item["row"], item.get("label")) for item in pending]
     ok = True
 
     for i in range(0, len(embeds), EMBEDS_PER_MESSAGE):
@@ -522,31 +589,32 @@ def main():
     pending = []          # rows that are new AND not already in the ledger
     seen_this_run = set() # guards against the same URL arriving from two repos
 
-    for repo in REPOS:
-        state_file = STATE_DIR / (repo.replace("/", "_") + ".txt")
+    for repo, path, mode in SOURCES:
+        label = source_id(repo, path)
+        state_file = STATE_DIR / (f"{repo}_{path}".replace("/", "_").replace(".md", "") + ".txt")
         try:
-            new_text = fetch_readme(repo)
+            new_text = fetch_file(repo, path)
         except Exception as e:
-            print(f"Failed to fetch {repo}: {e}")
+            print(f"Failed to fetch {label}: {e}")
             continue
 
-        rows = extract_rows(new_text)
+        rows = [r for r in extract_rows(new_text) if keep_row(r, mode)]
 
         if seeding:
             for row in rows:
                 ledger[ledger_key(repo, row)] = now
             state_file.write_text(new_text, encoding="utf-8")
-            print(f"Seeded {len(rows)} existing postings for {repo} (no notifications)")
+            print(f"Seeded {len(rows):4} postings from {label}")
             continue
 
         # The snapshot narrows down what changed; the ledger has the final
         # say on whether it's ever been sent.
         if state_file.exists():
-            candidates = find_new_rows(repo, state_file.read_text(encoding="utf-8"), new_text)
+            candidates = find_new_rows(repo, state_file.read_text(encoding="utf-8"), new_text, mode)
         else:
             # Snapshot lost (e.g. a state commit failed). Fall back to
             # checking every current row against the ledger.
-            print(f"No snapshot for {repo}; falling back to full ledger comparison.")
+            print(f"No snapshot for {label}; falling back to full ledger comparison.")
             candidates = rows
 
         unsent = []
@@ -554,14 +622,14 @@ def main():
             k = ledger_key(repo, r)
             if k in ledger or k in seen_this_run:
                 continue
-            seen_this_run.add(k)   # same job in two repos -> announce once
+            seen_this_run.add(k)   # same job in two lists -> announce once
             unsent.append(r)
         skipped = len(candidates) - len(unsent)
         if skipped:
-            print(f"{repo}: skipped {skipped} row(s) already in the ledger.")
+            print(f"{label}: skipped {skipped} row(s) already known.")
 
         for row in unsent:
-            pending.append({"repo": repo, "row": row})
+            pending.append({"repo": repo, "label": label, "row": row})
 
         state_file.write_text(new_text, encoding="utf-8")
 
@@ -576,8 +644,9 @@ def main():
     if len(pending) > FLOOD_THRESHOLD:
         by_repo = {}
         for item in pending:
-            by_repo[item["repo"]] = by_repo.get(item["repo"], 0) + 1
-        breakdown = ", ".join(f"{r.split('/')[-1]}: {n}" for r, n in by_repo.items())
+            k = item.get("label") or item["repo"]
+            by_repo[k] = by_repo.get(k, 0) + 1
+        breakdown = ", ".join(f"{r}: {n}" for r, n in by_repo.items())
         send_compact_list(pending, (
             f"{len(pending)} postings looked new this run ({breakdown}). That usually means a "
             "repo changed its link format rather than a real surge. Listing them compactly "
@@ -596,6 +665,7 @@ def main():
                 ledger[ledger_key(repo, row)] = now
                 f.write(json.dumps({
                     "repo": repo,
+                    "source": item.get("label"),
                     "cells": row["cells"],
                     "link": row["link"],
                     "seen_at": now,

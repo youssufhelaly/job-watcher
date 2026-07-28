@@ -66,36 +66,50 @@ which stays private even on a public repo. If you'd rather keep it
 private anyway, change the cron to `*/30 * * * *` (~1,440 runs/month)
 to stay inside the free allowance.
 
-### 2. Your four repos are already configured
-`check_jobs.py` is already set to watch:
-- `SimplifyJobs/Summer2026-Internships`
-- `vanshb03/Summer2027-Internships`
-- `speedyapply/2027-SWE-College-Jobs`
-- `speedyapply/2027-AI-College-Jobs`
+### 2. Sources are already configured
+Internships and co-ops only — no new-grad roles. Several of these repos
+keep **more than one list**, and only one is linked as the main README,
+so watching just the README would have missed most of two repos.
+`check_jobs.py` reads ten files:
 
-I pulled the live README from each of these four and tested the parser
-against the real content (not just against one sample) before finishing
-this build. Three quirks came up worth knowing about:
+| Source | File | Kept | Postings |
+| --- | --- | --- | --- |
+| SimplifyJobs/Summer2026-Internships | README | all | 231 |
+| vanshb03/Summer2027-Internships | README | all | 144 |
+| speedyapply/2027-SWE-College-Jobs | README (USA) | all | 155 |
+| speedyapply/2027-SWE-College-Jobs | INTERN_INTL | all | 244 |
+| speedyapply/2027-AI-College-Jobs | README (USA) | all | 195 |
+| speedyapply/2027-AI-College-Jobs | INTERN_INTL | all | 300 |
+| speedyapply/2027-SWE-College-Jobs | NEW_GRAD_USA | co-ops only | 1 |
+| speedyapply/2027-SWE-College-Jobs | NEW_GRAD_INTL | co-ops only | 1 |
+| speedyapply/2027-AI-College-Jobs | NEW_GRAD_USA | co-ops only | 0 |
+| speedyapply/2027-AI-College-Jobs | NEW_GRAD_INTL | co-ops only | 0 |
 
-- **SimplifyJobs** uses raw HTML `<table>` markup, not markdown tables.
-  Handled automatically — the parser detects HTML tables first and
-  falls back to markdown pipe-tables when there isn't one.
-- **vanshb03** and both **speedyapply** repos use markdown pipe tables,
-  but embed the actual apply link as raw HTML (`<a href="...">`)
-  *inside* the cell rather than markdown `[text](url)` syntax — also
-  handled.
-- The **speedyapply** repos list two links per row: the company's
-  generic homepage (e.g. `google.com`) *and* the specific application
-  link. Grabbing the first one would've caused every posting from the
-  same company to look identical to the watcher. The parser prefers
-  the more specific (longer-path) link, so this is a non-issue — but
-  it's a good example of why "looks fine on one sample" isn't the same
-  as tested.
+**1,221 unique postings** after cross-list dedupe.
 
-If you swap in a different repo later, the parser should handle either
-table style automatically — but if it stores listings some other way
-(e.g. a separate JSON file instead of the README), send me the URL and
-I'll adjust it.
+**Why the new-grad files are read at all.** They're mostly full-time
+graduate roles you don't want — but a couple of genuine co-ops get filed
+there by mistake (e.g. "Software Engineering Co-op_Spring 2027"). Those
+files are scanned with an `intern_coop` filter: 1,289 rows in, 2 kept.
+Skipping them entirely would have silently lost those two.
+
+The filter matches Intern / Internship / Co-op / Coop / Co op in the role
+title, and deliberately does *not* match "Internal" or "International".
+To change what's included, edit `SOURCES` at the top of `check_jobs.py`
+— set a file to `"all"` to take everything from it, or drop the line to
+ignore it.
+
+SimplifyJobs keeps all five categories (Software Engineering, Product
+Management, Data Science/AI/ML, Quantitative Finance, Hardware) in one
+README — all captured, with Legend/FAQ/contributor tables correctly
+ignored.
+
+Two format quirks, both handled automatically:
+- **SimplifyJobs** uses raw HTML `<table>` markup; the rest use markdown
+  pipe tables.
+- **speedyapply** rows carry two links (company homepage *and* the real
+  apply link); the parser prefers the specific one, otherwise every job
+  at a given company would look identical.
 
 ### 3. Create the Discord webhook
 1. In Discord, pick (or create) the channel you want jobs posted to.
@@ -184,7 +198,7 @@ followed by all of them as a compact list, roughly 40 per message
 instead of individual cards. Nothing is dropped. Tune with
 `FLOOD_THRESHOLD`.
 
-**First run sends nothing.** It seeds the ledger with the ~679 unique
+**First run sends nothing.** It seeds the ledger with the ~1,221 unique
 postings already live across your four repos. Alerts start next run.
 
 ## A couple of honest caveats
