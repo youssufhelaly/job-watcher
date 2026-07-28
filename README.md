@@ -38,15 +38,68 @@ within seconds:
   repos frequently re-sort their tables; a position-based diff would
   misfire constantly, this doesn't.
 - New postings are posted to your Discord channel as embeds — company,
-  role, location, pay, and a clickable apply link. They're batched 10
-  to a message so a burst of listings can't trip Discord's webhook rate
-  limit. A single new job posts immediately as a single card — batching
-  is a ceiling, never a wait.
+  role, location, pay, and a clickable apply link. One job per message,
+  so a reaction on a message means something about that one posting
+  (see [Triage](#triage)). Above `FLOOD_THRESHOLD` postings in a single
+  run the flood valve takes over and sends one compact list instead —
+  that many rows at once almost always means a repo changed its link
+  format, and it isn't something you'd triage anyway.
 - `daily_digest.py` (optional, separate workflow) reads everything
   found in the last 24 hours and sends one morning summary instead of
   / in addition to the instant pushes.
 - State (which postings have already been seen) is committed back into
   the repo after each run, so there's no external database needed.
+
+## Triage
+
+Three channels. Postings land in the feed; you route each one out of it.
+
+| Channel | Holds |
+|---|---|
+| `#jobs` | the raw feed — every new posting the watcher finds |
+| `#shortlist` | the work queue — jobs you mean to apply to, not yet done |
+| `#applied` | the record — jobs you've sent |
+
+**From the feed**, every posting gets one of three moves:
+
+| Decision | Do this |
+|---|---|
+| Not interested | react ❌ |
+| Apply later | Forward → `#shortlist`, react 🔖 |
+| Applying now | Forward → `#applied`, react ✅ |
+
+The reaction is what stops you re-reading a posting you've already
+judged. The forward is what routes it. Applying straight from the feed
+skips `#shortlist` on purpose — the queue is only for *later*, and if
+everything flowed through it, it would never be empty.
+
+**Working the queue:** open `#shortlist`, apply to something, forward it
+to `#applied`, delete it from `#shortlist`. It's gone from the queue and
+still on the record. A channel that only holds unprocessed work is the
+whole trick — deleting is dequeuing, and Discord already does the rest.
+
+### Why this and not a bot
+
+Buttons that write to a real pipeline database are buildable — a Discord
+app plus a Cloudflare Worker on the interactions endpoint, no always-on
+process needed. The difference is clicks, not capability: one button
+instead of a forward and a react.
+
+But every tracker dies the same way, which is that you stop updating it.
+So this runs first, with nothing to deploy and nothing to maintain.
+After a week the answer is visible without counting anything: **did
+`#shortlist` ever reach zero?** If you worked the queue down, the habit
+is real and the buttons are worth building. If it silted up, buttons
+would have silted up too — the bottleneck was never the clicks.
+
+One thing to know either way: ✅ will undercount. You click through and
+submit twenty minutes later on some Workday page, long after the message
+scrolled away. `#applied` is a good record, your email is the complete
+one. ❌ and 🔖 carry the reliable signal, because those are decisions you
+make in the moment you read the posting.
+
+And if you're ❌-ing most of what arrives, the fix isn't better tracking.
+It's tighter filtering upstream in `check_jobs.py`.
 
 ## Setup (10–15 minutes)
 

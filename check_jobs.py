@@ -419,9 +419,13 @@ def migrate_ledger(ledger: dict) -> tuple[dict, int]:
 # 4. Discord notifications
 # ---------------------------------------------------------------------------
 # Discord webhooks are rate limited (roughly 5 requests per 5 seconds per
-# webhook), and an embed message can carry up to 10 embeds. So instead of
-# one HTTP request per job -- which would get throttled the moment a repo
-# adds 20 postings at once -- jobs are batched 10 to a message.
+# webhook) and a message can carry up to 10 embeds, so batching was the
+# obvious way to survive a repo dumping 20 postings at once.
+#
+# One job per message costs more requests, but a reaction attaches to a
+# MESSAGE, not to an embed -- so triage marks (applied / no / save) are
+# meaningless on a ten-job card. The flood path below still batches,
+# because a 200-row false positive is noise nobody triages anyway.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # With no webhook configured there is nowhere to deliver, so the run only
@@ -429,7 +433,7 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 # that mode would mark postings as notified that nobody ever received.
 DRY_RUN = not DISCORD_WEBHOOK
 
-EMBEDS_PER_MESSAGE = 10
+EMBEDS_PER_MESSAGE = 1
 DISCORD_COLORS = {
     "SimplifyJobs/Summer2026-Internships": 0x5865F2,   # blurple
     "vanshb03/Summer2027-Internships": 0x57F287,       # green
@@ -514,7 +518,7 @@ def build_job_embed(repo: str, row: dict, label: str | None = None) -> dict:
 
 
 def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
-    """Post every new job as a Discord embed, batched to respect limits.
+    """Post every new job as its own Discord card, one per message.
 
     Returns the items that actually reached Discord. Anything missing from
     that list must NOT be written to the ledger -- leaving it out is what
