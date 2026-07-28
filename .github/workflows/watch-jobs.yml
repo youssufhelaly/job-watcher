@@ -41,6 +41,10 @@ jobs:
           # deliver normally with neither set.
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          # Set either to 0 to receive grad-level / new-grad postings
+          # again (tagged rather than dropped). See "What gets dropped".
+          EXCLUDE_GRAD_LEVEL: "1"
+          EXCLUDE_NEW_GRAD: "1"
         run: python check_jobs.py
 
       - name: Save updated snapshot state

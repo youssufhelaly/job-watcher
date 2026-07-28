@@ -86,12 +86,273 @@ INTERN_COOP_RE = re.compile(
 )
 
 
+# Roles to drop everywhere, on every list, regardless of the filter mode.
+#
+# Two separate things get dropped, and they fail the intern/co-op filter
+# in opposite ways:
+#
+#   grad-level -- a real internship, but for PhD / master's / MBA
+#                 students. "Quantitative Researcher PhD Intern" is an
+#                 internship you cannot apply to.
+#   new-grad   -- not an internship at all, just filed as if it were.
+#
+# Set either flag to 0 to get those back as tagged-but-delivered.
+EXCLUDE_GRAD_LEVEL = os.environ.get("EXCLUDE_GRAD_LEVEL", "1") != "0"
+EXCLUDE_NEW_GRAD = os.environ.get("EXCLUDE_NEW_GRAD", "1") != "0"
+
+# Markers that an internship is pitched at postgraduates. These override
+# the intern/co-op check -- the role IS an internship, which is exactly
+# why the word "intern" can't rescue it.
+GRAD_LEVEL_TERMS = [
+    "phd", "ph.d", "ph.d.", "doctoral", "doctorate",
+    "graduate student", "grad student", "graduate students",
+    "masters student", "master's student", "ms/phd", "msc/phd",
+    "graduate intern", "graduate research", "graduate level",
+    "postgraduate", "post-graduate", "mba",
+]
+
+# Phrases, never the bare word "graduate" -- these lists carry real
+# internships called "Graduation Internship" (Accenture runs several),
+# and matching "graduate" alone would throw them away. Every term here
+# names a full-time entry-level role.
+NEW_GRAD_TERMS = [
+    "new grad", "new grads", "new graduate", "new graduates", "newgrad",
+    "graduate program", "graduate programme", "graduate scheme",
+    "graduate rotational", "grad program", "graduate trainee",
+    "graduate analyst", "graduate engineer", "graduate developer",
+    "graduate consultant", "graduate scientist", "campus hire",
+    "entry level", "entry-level",
+]
+
+
+def excluded_role(role: str) -> str | None:
+    """Why this role is being dropped, or None to keep it."""
+    # Grad-level overrides everything, including the intern check.
+    if EXCLUDE_GRAD_LEVEL and _GRAD_LEVEL_RE.search(role):
+        return "grad-level"
+
+    # A title LEADING with "Graduate" means a graduate-student role in
+    # both conventions -- UK new-grad ("Graduate Software Engineer") and
+    # US grad-student ("Graduate Research Intern") -- so it drops even
+    # when the title also says intern. "Graduation Internship" is a
+    # different thing (a thesis project) and is not matched.
+    if EXCLUDE_NEW_GRAD and re.match(r"\s*graduate(?![a-z])", role, re.I):
+        return "new-grad"
+
+    # A new-grad phrase does NOT override an explicit intern/co-op role.
+    # Real examples that must survive: Boeing's "Intern to Entry Level
+    # Conversion Intern Program" and "Entry-Level Software Engineer -
+    # Internship - Fresh Graduate". Both are internships that happen to
+    # contain "entry level".
+    # A title LEADING with "Graduate" is the British new-grad convention
+    # ("Graduate Software Engineer"). Anchored to the start so
+    # "Graduation Internship ..." and "Graduate Research Intern" -- which
+    # the intern check below rescues anyway -- aren't caught by accident.
+    if EXCLUDE_NEW_GRAD and _NEW_GRAD_RE.search(role) and not INTERN_COOP_RE.search(role):
+        return "new-grad"
+
+    return None
+
+
 def keep_row(row: dict, mode: str) -> bool:
-    if mode == "all":
-        return True
     cells = row.get("cells") or []
     role = cells[1] if len(cells) > 1 else ""
+
+    if excluded_role(role):
+        return False
+
+    if mode == "all":
+        return True
     return bool(INTERN_COOP_RE.search(role))
+
+
+# ---------------------------------------------------------------------------
+# 1b. CATEGORIES -- the tags stamped on each card
+# ---------------------------------------------------------------------------
+# Ten source files with overlapping contents means "where did this come
+# from" is not obvious from the posting itself, and the interesting
+# questions (is it a big name? is it AI? can I even apply?) aren't
+# answered by the source at all. So every posting gets classified on four
+# axes and the tags ride along on the card.
+#
+# All of it is derived from the row text, so it costs nothing per run and
+# can't fail a delivery. Everything below is meant to be edited -- add
+# companies you care about, drop tiers you don't.
+
+# Company tiers, most specific first: a name matched by an earlier tier
+# is not tested against later ones (Google is FAANG, not Big Tech).
+COMPANY_TIERS = [
+    ("⭐ FAANG", [
+        "meta", "facebook", "apple", "amazon", "aws", "netflix",
+        "google", "alphabet", "youtube",
+    ]),
+    ("\U0001F9EA AI lab", [
+        "openai", "anthropic", "deepmind", "google deepmind", "mistral",
+        "cohere", "scale ai", "perplexity", "xai", "hugging face",
+        "figure", "waymo", "cruise", "midjourney", "runway",
+        "character.ai", "inflection", "adept", "sakana",
+    ]),
+    ("\U0001F4C8 Quant", [
+        "jane street", "citadel", "citadel securities", "two sigma",
+        "hudson river trading", "hrt", "optiver", "imc", "imc trading",
+        "jump trading", "de shaw", "d. e. shaw", "akuna capital",
+        "susquehanna", "sig", "point72", "millennium", "drw",
+        "old mission", "belvedere", "five rings", "virtu",
+        "tower research", "xtx", "squarepoint", "balyasny", "cubist",
+        "peak6", "group one", "radix", "qube", "marshall wace",
+    ]),
+    ("\U0001F3E2 Big Tech", [
+        "microsoft", "nvidia", "tesla", "uber", "lyft", "airbnb",
+        "stripe", "databricks", "snowflake", "salesforce", "adobe",
+        "intel", "amd", "qualcomm", "ibm", "oracle", "linkedin",
+        "tiktok", "bytedance", "snap", "spotify", "pinterest",
+        "dropbox", "cloudflare", "palantir", "roblox", "coinbase",
+        "samsung", "sony", "bloomberg", "atlassian", "shopify",
+        "servicenow", "vmware", "cisco", "dell", "hp", "sap",
+        "paypal", "block", "square", "doordash", "instacart",
+        "reddit", "discord", "figma", "notion", "canva", "twilio",
+        "datadog", "mongodb", "hubspot", "zoom", "slack",
+        # Names that actually show up in these lists in volume, mostly
+        # semiconductor and industrial. Worth a tier because they hire
+        # heavily for the hardware roles tagged below.
+        "tencent", "alibaba", "baidu", "huawei", "xiaomi", "asml",
+        "nxp", "bosch", "siemens", "philips", "hitachi", "panasonic",
+        "ericsson", "nokia", "tsmc", "micron", "texas instruments",
+        "analog devices", "broadcom", "arm", "marvell", "infineon",
+        "stmicroelectronics", "renesas", "rivian", "motorola",
+        "ge", "honeywell", "abb", "schneider electric", "lockheed",
+    ]),
+]
+
+# Role-text domains. A posting can carry more than one of these.
+ROLE_DOMAINS = [
+    ("\U0001F9E0 AI/ML", [
+        "machine learning", "ml", "ai", "artificial intelligence",
+        "deep learning", "nlp", "llm", "computer vision", "cv",
+        "data scien", "research scientist", "perception", "robotics",
+        "reinforcement learning", "generative", "genai", "mlops",
+    ]),
+    ("\U0001F527 Hardware", [
+        "hardware", "embedded", "firmware", "fpga", "asic", "rtl",
+        "silicon", "verification", "signal processing", "dsp", "rf",
+        "analog", "pcb", "vlsi", "soc",
+    ]),
+    ("\U0001F510 Security", [
+        "security", "cryptography", "appsec", "infosec", "malware",
+        "penetration", "vulnerability",
+    ]),
+]
+
+# Roles you cannot apply to are worth flagging loudly -- several of these
+# lists are thick with PhD-only research internships.
+PHD_ONLY = ["phd", "ph.d", "doctoral", "doctorate"]
+
+US_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI",
+    "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI",
+    "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC",
+    "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
+    "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+}
+CA_PROVINCES = {"ON", "QC", "BC", "AB", "MB", "SK", "NS", "NB", "NL", "PE"}
+US_NAMES = {"USA", "US", "U.S.", "U.S.A.", "UNITED STATES"}
+
+# Placeholders, not places. Without this they'd read as "somewhere that
+# isn't a US state", which the fallback would call International.
+VAGUE_LOCATIONS = {
+    "MULTIPLE LOCATIONS", "VARIOUS", "VARIOUS LOCATIONS", "TBD", "N/A",
+    "MULTIPLE", "SEVERAL LOCATIONS", "NATIONWIDE",
+}
+
+
+def _term_re(terms: list[str]) -> re.Pattern:
+    """Match any term as a whole word, tolerating punctuation in names.
+
+    Same lookaround trick as INTERN_COOP_RE: plain \\b breaks on the
+    short uppercase terms that matter most here. "ML" must not match
+    inside "HTML", and "AI" must not match inside "Chair" -- with these
+    lookarounds neither does, because the neighbouring character is
+    alphanumeric in both cases.
+    """
+    alts = "|".join(sorted((re.escape(t) for t in terms), key=len, reverse=True))
+    return re.compile(rf"(?<![a-z0-9])({alts})(?![a-z0-9])", re.I)
+
+
+_TIER_RES = [(tag, _term_re(names)) for tag, names in COMPANY_TIERS]
+_DOMAIN_RES = [(tag, _term_re(terms)) for tag, terms in ROLE_DOMAINS]
+_PHD_RE = _term_re(PHD_ONLY)
+# Used by excluded_role() above, which runs long after import.
+_GRAD_LEVEL_RE = _term_re(GRAD_LEVEL_TERMS)
+_NEW_GRAD_RE = _term_re(NEW_GRAD_TERMS)
+
+
+def _region_tags(label: str, location: str) -> list[str]:
+    """Region from the location cell, with the source file as a fallback.
+
+    Location text is more trustworthy than the file name: speedyapply's
+    USA lists do carry the odd Canadian posting, and Simplify has no
+    USA/INTL split at all.
+    """
+    loc = location or ""
+    tags = []
+
+    remote_re = re.compile(r"(?<![a-z0-9])remote(?![a-z0-9])", re.I)
+    if remote_re.search(loc):
+        tags.append("\U0001F3E0 Remote")
+    # "Remote" on its own names no country, so it must not fall through to
+    # the International guess below. "Remote, US" still has "US" to go on.
+    stripped = remote_re.sub("", loc).strip(" ,;/-")
+    named_place = bool(re.sub(r"[^a-z0-9]", "", stripped, flags=re.I)) \
+        and stripped.upper() not in VAGUE_LOCATIONS
+
+    # Trailing "..., NY" / "..., ON" is the reliable signal.
+    tail = {p.strip().upper() for p in loc.split(",")}
+    if "CANADA" in tail or tail & CA_PROVINCES:
+        tags.append("\U0001F1E8\U0001F1E6 Canada")
+    elif tail & US_STATES or tail & US_NAMES:
+        tags.append("\U0001F1FA\U0001F1F8 USA")
+    elif "INTL" in (label or "").upper():
+        tags.append("\U0001F30D International")
+    elif named_place:
+        # A place that names neither a US state nor a province is
+        # somewhere else in the world.
+        tags.append("\U0001F30D International")
+
+    return tags
+
+
+def classify(repo: str, label: str, row: dict) -> list[str]:
+    """Tags for one posting, in reading order: who / what / who-can / where."""
+    cells = row.get("cells") or []
+    company = cells[0] if cells else ""
+    role = cells[1] if len(cells) > 1 else ""
+    location = cells[2] if len(cells) > 2 else ""
+
+    tags = []
+
+    for tag, pattern in _TIER_RES:
+        if pattern.search(company):
+            tags.append(tag)
+            break          # one tier per company
+
+    domains = [tag for tag, pattern in _DOMAIN_RES if pattern.search(role)]
+    # The AI repo is an AI list by construction, so trust it when the role
+    # title alone doesn't say so ("Research Intern - Redmond").
+    ai_tag = ROLE_DOMAINS[0][0]
+    if "AI-College-Jobs" in repo and ai_tag not in domains:
+        domains.insert(0, ai_tag)
+    tags.extend(domains)
+
+    if _PHD_RE.search(role):
+        tags.append("\U0001F393 PhD")
+
+    if "NEW_GRAD" in (label or "").upper():
+        # Kept only because it read as a co-op; flagged because it was
+        # filed on a new-grad list and may really be full-time.
+        tags.append("⚠️ Filed new-grad")
+
+    tags.extend(_region_tags(label, location))
+    return tags
 
 
 # Used for ledger-migration detection and nothing else.
@@ -274,11 +535,54 @@ def _disambiguate_keys(rows: list[dict]) -> list[dict]:
     return rows
 
 
+# Simplify and vanshb03 write the company cell as "↳" when a row belongs
+# to the same company as the row above it. Left alone, that posting shows
+# up as a card titled "↳ — Software Engineer Intern" and can't be matched
+# against the company tiers.
+CONTINUATION_MARKERS = {"↳", "⤷", "→"}   # ↳ ⤷ →
+
+
+def _fill_continuation_companies(rows: list[dict]) -> list[dict]:
+    """Replace "↳" company cells with the company they point back to.
+
+    Runs AFTER the identity key is computed, deliberately: the key is
+    derived from the original cells, so filling these in cannot shift a
+    ledger key and cannot cause a re-notification.
+
+    Only the explicit markers are treated as continuations. A blank
+    company cell is left blank -- a wrong company name is worse than a
+    missing one.
+    """
+    last_company = None
+    for row in rows:
+        cells = row.get("cells")
+        if not cells:
+            continue
+        company = cells[0].strip()
+        if company in CONTINUATION_MARKERS:
+            if last_company:
+                cells[0] = last_company
+        elif company:
+            last_company = company
+    return rows
+
+
 def extract_rows(text: str) -> list[dict]:
     soup = BeautifulSoup(text, "html.parser")
     html_rows = extract_rows_html(soup)
     rows = html_rows if html_rows else extract_rows_markdown(text)
-    return _disambiguate_keys(rows)
+    rows = _disambiguate_keys(rows)
+
+    # Pin the role signature to the row AS PARSED, because ledger_key
+    # computes it from the company cell at notify time -- so filling in a
+    # "↳" below would silently rewrite the key of every evergreen-link
+    # posting and re-announce it. Filling first and keying second would
+    # give a marginally stronger signature; keeping keys stable is worth
+    # more than that.
+    for row in rows:
+        row["sig"] = role_signature(row)
+
+    return _fill_continuation_companies(rows)
 
 
 def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all") -> list[dict]:
@@ -396,7 +700,10 @@ def ledger_key(repo: str, row: dict) -> str:
     url = normalize_url(link)
     if JOB_ID_RE.search(url):
         return url                                  # unambiguous requisition
-    return f"{url}#{role_signature(row)}"           # evergreen page: add role
+    # Prefer the signature pinned at parse time; fall back for rows built
+    # by hand (tests) that never went through extract_rows.
+    sig = row.get("sig") or role_signature(row)
+    return f"{url}#{sig}"                           # evergreen page: add role
 
 
 def migrate_ledger(ledger: dict) -> tuple[dict, int]:
@@ -651,6 +958,16 @@ def build_job_embed(repo: str, row: dict, label: str | None = None,
     if apply_field and row.get("link"):
         embed["fields"].append({"name": "Apply", "value": _clip(f"[Open posting]({row['link']})", MAX_FIELD_VALUE), "inline": True})
 
+    # Tags last and full-width, so they read as one line under the
+    # details rather than competing with them for a column.
+    tags = classify(repo, label or "", row)
+    if tags:
+        embed["fields"].append({
+            "name": "Tags",
+            "value": _clip(" · ".join(tags), MAX_FIELD_VALUE),
+            "inline": False,
+        })
+
     return embed
 
 
@@ -877,6 +1194,9 @@ def main():
                         "source": item.get("label"),
                         "cells": row["cells"],
                         "link": row["link"],
+                        # Logged as well as displayed, so the digest can
+                        # group by tag without re-deriving anything.
+                        "tags": classify(item["repo"], item.get("label") or "", row),
                         "seen_at": now,
                     }) + "\n")
 

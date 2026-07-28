@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -c pull.rebase=true pull --rebase origin main)",
+      "Bash(git config *)",
+      "Bash(curl -s \"https://api.github.com/repos/youssufhelaly/job-watcher/actions/runs?per_page=4\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import requests, bs4; print\\('deps ok', bs4.__version__\\)\")",
+      "Bash(grep -oE '<td>🔒</td>|href=\"[^\"]{0,80}')"
+    ]
+  }
+}

@@ -51,6 +51,76 @@ within seconds:
 - State (which postings have already been seen) is committed back into
   the repo after each run, so there's no external database needed.
 
+## Tags
+
+Ten source files overlap heavily, so "where did this come from" isn't
+obvious from the posting — and the questions that actually matter (big
+name? AI? can I even apply?) aren't answered by the source at all. Every
+card carries tags on four axes, all derived from the row text, so they
+cost nothing per run and can't fail a delivery.
+
+| Axis | Tags |
+|---|---|
+| Company | ⭐ FAANG · 🧪 AI lab · 📈 Quant · 🏢 Big Tech |
+| Domain | 🧠 AI/ML · 🔧 Hardware · 🔐 Security |
+| Eligibility | 🎓 PhD · ⚠️ Filed new-grad |
+| Region | 🇺🇸 USA · 🇨🇦 Canada · 🌍 International · 🏠 Remote |
+
+Measured over the postings currently in `state/`: 47% AI/ML, 50%
+International, 12% Quant. **⚠️ Filed new-grad** is the one to watch — a
+row kept off a new-grad list because it read as a co-op, so it may really
+be full-time.
+
+### What gets dropped
+
+Two kinds of posting are filtered out entirely rather than tagged. They
+fail the intern/co-op filter in opposite directions:
+
+| Reason | What it is |
+|---|---|
+| `grad-level` | a real internship, but for PhD / master's / MBA students |
+| `new-grad` | not an internship at all, just filed on these lists as one |
+
+On the current snapshots that's **76 of 1,273 dropped, 1,197 kept** — 75
+grad-level (mostly Citadel and Jane Street PhD research internships) and
+1 new-grad. Set `EXCLUDE_GRAD_LEVEL=0` or `EXCLUDE_NEW_GRAD=0` in the
+workflow env to get them back as tagged-but-delivered.
+
+The distinction that makes this work is that `grad-level` overrides the
+word "intern" and `new-grad` does not. "Quantitative Researcher PhD
+Intern" is genuinely an internship, which is exactly why "intern" can't
+rescue it. But "Intern to Entry Level Conversion Intern Program" and
+"Entry-Level Software Engineer - Internship" are internships that merely
+contain "entry level", so there the intern reading wins.
+
+Three real titles the word lists are shaped around, all of which must
+survive: **Graduation Internship** (a thesis project, not a graduate
+role), **Undergraduate Research Intern** (the lookbehind stops "graduate
+research" matching inside it), and the two "entry level" internships
+above. Matching the bare word "graduate" would throw all of them away.
+
+Region comes from the location cell first and the source file second,
+because speedyapply's USA lists do carry the odd Canadian posting and
+Simplify has no USA/INTL split at all. `COMPANY_TIERS` and `ROLE_DOMAINS`
+in `check_jobs.py` are plain lists meant to be edited.
+
+Tags also go into `state/new_jobs_log.jsonl`, so the digest can group by
+them, and filtering on them later ("skip PhD-only") is a one-line change.
+
+### The ↳ rows
+
+Simplify and vanshb03 write the company as `↳` when a row belongs to the
+same company as the row above — 110 of the 1,273. Those used to render as
+a card titled `↳ — Software Engineer Intern` and matched no company tier;
+now the real company is carried forward.
+
+The subtlety: for postings behind an evergreen careers page, the ledger
+key includes a signature built from the company cell **at notify time**,
+so filling these in would rewrite those keys and re-announce the
+postings. The signature is therefore pinned when the row is parsed,
+before the fill. Verified against the live ledger — 0 of 1,273 rows would
+re-notify.
+
 ## Triage
 
 Three channels. Postings land in the feed; you route each one out of it.
