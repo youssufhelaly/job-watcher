@@ -192,12 +192,17 @@ def _row_identity(cells: list[str], link: str | None) -> str:
 
 
 def _link_specificity(url: str) -> int:
-    # Bare homepage links (e.g. "https://www.google.com") have an empty/trivial
-    # path; real application links have a long, job-specific path. Longer
-    # path = more specific = more likely to be the actual posting, not the
-    # company's front page (which would collide across every job they post).
-    path = url.split("://", 1)[-1].split("/", 1)[1] if "/" in url.split("://", 1)[-1] else ""
-    return len(path.strip("/"))
+    """Length of the identifying part of a URL -- its path plus any query
+    parameter that actually names the posting.
+
+    Bare homepage links (e.g. "https://www.google.com") score 0; real
+    application links score high. Measured off normalize_url so tracking
+    params don't count -- otherwise a homepage padded with ?utm_campaign=...
+    would out-score a genuine job link.
+    """
+    ident = normalize_url(url)
+    host = ident.split("/", 1)[0].split("?", 1)[0]
+    return len(ident) - len(host)
 
 
 def _best_link(links: list[str]) -> str | None:
@@ -207,7 +212,9 @@ def _best_link(links: list[str]) -> str | None:
         return None
     specific = [l for l in candidates if _link_specificity(l) > 0]
     pool = specific if specific else candidates
-    return max(pool, key=len)
+    # Most specific wins. Ties go to the shortest URL, so the pick (and
+    # therefore the row's identity in the ledger) stays stable run to run.
+    return max(pool, key=lambda u: (_link_specificity(u), -len(u)))
 
 
 def extract_rows_html(soup: BeautifulSoup) -> list[dict]:
@@ -295,21 +302,32 @@ def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all") ->
 # be lost or fail to commit. The ledger is the durable record of what has
 # actually been PUSHED to the phone, so a failed state commit, a reset
 # snapshot, or a job being removed and re-added can't cause a repeat.
+class LedgerError(RuntimeError):
+    """The ledger exists but can't be trusted."""
+
+
 def load_ledger() -> dict:
     if not LEDGER_FILE.exists():
         return {}
     try:
         data = json.loads(LEDGER_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError) as e:
-        # A corrupt ledger must not cause a flood of re-notifications, so
-        # treat it as "everything already seen" and rebuild going forward.
-        print(f"WARNING: could not read ledger ({e}); treating as up to date.")
-        return {}
+        raise LedgerError(f"could not read ledger: {e}") from e
+    if not isinstance(data, dict):
+        raise LedgerError(f"ledger is a {type(data).__name__}, expected an object")
+    return data
 
 
 def save_ledger(ledger: dict):
+    if DRY_RUN:
+        return
     LEDGER_FILE.write_text(json.dumps(ledger, indent=0, sort_keys=True), encoding="utf-8")
+
+
+def write_snapshot(state_file: Path, text: str):
+    if DRY_RUN:
+        return
+    state_file.write_text(text, encoding="utf-8")
 
 
 # A URL containing a long numeric run is a specific job requisition
@@ -406,6 +424,11 @@ def migrate_ledger(ledger: dict) -> tuple[dict, int]:
 # adds 20 postings at once -- jobs are batched 10 to a message.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# With no webhook configured there is nowhere to deliver, so the run only
+# prints what it would have sent and persists nothing. Writing state in
+# that mode would mark postings as notified that nobody ever received.
+DRY_RUN = not DISCORD_WEBHOOK
+
 EMBEDS_PER_MESSAGE = 10
 DISCORD_COLORS = {
     "SimplifyJobs/Summer2026-Internships": 0x5865F2,   # blurple
@@ -490,47 +513,58 @@ def build_job_embed(repo: str, row: dict, label: str | None = None) -> dict:
     return embed
 
 
-def send_jobs_to_discord(pending: list[dict]) -> bool:
-    """Post every new job as a Discord embed, batched to respect limits."""
-    embeds = [build_job_embed(item["repo"], item["row"], item.get("label")) for item in pending]
-    ok = True
+def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
+    """Post every new job as a Discord embed, batched to respect limits.
 
-    for i in range(0, len(embeds), EMBEDS_PER_MESSAGE):
-        batch = embeds[i : i + EMBEDS_PER_MESSAGE]
-        header = None
+    Returns the items that actually reached Discord. Anything missing from
+    that list must NOT be written to the ledger -- leaving it out is what
+    makes the next run retry it instead of dropping it silently.
+    """
+    delivered = []
+
+    for i in range(0, len(pending), EMBEDS_PER_MESSAGE):
+        batch = pending[i : i + EMBEDS_PER_MESSAGE]
+        payload = {"embeds": [
+            build_job_embed(item["repo"], item["row"], item.get("label")) for item in batch
+        ]}
         if i == 0:
-            n = len(embeds)
-            header = f"**{n} new posting{'s' if n != 1 else ''}**"
-        payload = {"embeds": batch}
-        if header:
-            payload["content"] = _clip(header, MAX_CONTENT)
-        if not _post_discord(payload):
-            ok = False
+            n = len(pending)
+            payload["content"] = _clip(f"**{n} new posting{'s' if n != 1 else ''}**", MAX_CONTENT)
+
+        if _post_discord(payload):
+            delivered.extend(batch)
+        else:
+            print(f"Batch of {len(batch)} posting(s) failed to send; they will be retried next run.")
         # Stay comfortably under the webhook rate limit between batches.
-        if i + EMBEDS_PER_MESSAGE < len(embeds):
+        if i + EMBEDS_PER_MESSAGE < len(pending):
             time.sleep(1.2)
 
-    return ok
+    return delivered
 
 
-def send_compact_list(pending: list[dict], reason: str) -> bool:
+def _compact_line(item: dict) -> str:
+    cells = item["row"]["cells"]
+    company = cells[0] if cells else "?"
+    role = cells[1] if len(cells) > 1 else ""
+    link = item["row"].get("link")
+    label = f"**{company}** — {role}".strip(" —")
+    return f"{label} — <{link}>" if link else label
+
+
+def send_compact_list(pending: list[dict], reason: str) -> list[dict]:
     """Deliver a large batch as compact text lines rather than rich cards.
 
     Used when a run turns up an unusual number of postings. Rich embeds
     would mean dozens of messages; this keeps the volume manageable
     WITHOUT dropping anything, because a missed posting is worse than a
     noisy channel.
-    """
-    lines = []
-    for item in pending:
-        cells = item["row"]["cells"]
-        company = cells[0] if cells else "?"
-        role = cells[1] if len(cells) > 1 else ""
-        link = item["row"].get("link")
-        label = f"**{company}** — {role}".strip(" —")
-        lines.append(f"{label} — <{link}>" if link else label)
 
-    ok = _post_discord({
+    Returns the items that actually reached Discord, same contract as
+    send_jobs_to_discord.
+    """
+    delivered = []
+
+    _post_discord({
         "embeds": [{
             "title": "Job watcher: unusual spike",
             "description": _clip(reason, 4096),
@@ -540,33 +574,29 @@ def send_compact_list(pending: list[dict], reason: str) -> bool:
     })
 
     # Pack lines into embed descriptions (4096 cap each, 6000 per message).
+    # Items travel alongside their rendered line so a failed chunk leaves
+    # exactly those postings out of the delivered set.
     chunk, size = [], 0
     def flush():
-        nonlocal chunk, size, ok
+        nonlocal chunk, size
         if not chunk:
             return
-        if not _post_discord({"embeds": [{"description": "\n".join(chunk), "color": 0x99AAB5}]}):
-            ok = False
+        body = "\n".join(_compact_line(item) for item in chunk)
+        if _post_discord({"embeds": [{"description": body, "color": 0x99AAB5}]}):
+            delivered.extend(chunk)
+        else:
+            print(f"Compact chunk of {len(chunk)} posting(s) failed to send; they will be retried next run.")
         chunk, size = [], 0
         time.sleep(1.2)
 
-    for line in lines:
-        if size + len(line) + 1 > 3800:
+    for item in pending:
+        line_len = len(_compact_line(item)) + 1
+        if size + line_len > 3800:
             flush()
-        chunk.append(line)
-        size += len(line) + 1
+        chunk.append(item)
+        size += line_len
     flush()
-    return ok
-    """Plain-text alert (used for spike warnings and the daily digest)."""
-    embed = {
-        "title": _clip(title, MAX_EMBED_TITLE),
-        "description": _clip(message, 4096),
-        "color": 0xED4245,   # red -- these are attention messages
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    if url:
-        embed["url"] = url
-    _post_discord({"embeds": [embed]})
+    return delivered
 
 
 # ---------------------------------------------------------------------------
@@ -574,13 +604,28 @@ def send_compact_list(pending: list[dict], reason: str) -> bool:
 # ---------------------------------------------------------------------------
 def main():
     STATE_DIR.mkdir(exist_ok=True)
+    if DRY_RUN:
+        print("DISCORD_WEBHOOK_URL is not set -- dry run. Notifications are printed "
+              "below and no snapshot or ledger changes will be saved.")
 
     # No ledger yet means either a fresh install or an upgrade from the
     # earlier snapshot-only version. Either way, seed it from what's live
     # right now and send nothing -- otherwise the first run would push
     # every posting that already exists.
     seeding = not LEDGER_FILE.exists()
-    ledger = load_ledger()
+    try:
+        ledger = load_ledger()
+    except LedgerError as e:
+        # An unreadable ledger can't be trusted to answer "already sent?",
+        # and carrying on with an empty one would re-announce every live
+        # posting. Keep the bad copy for inspection and re-seed instead:
+        # one silent run, then normal operation resumes.
+        backup = LEDGER_FILE.with_name("notified.corrupt.json")
+        if not DRY_RUN:
+            LEDGER_FILE.replace(backup)
+        print(f"::error::Ledger unreadable ({e}). Moved it to {backup} and re-seeding "
+              "from what is live now; no alerts this run.")
+        ledger, seeding = {}, True
     ledger, migrated = migrate_ledger(ledger)
     if migrated:
         print(f"Migrated {migrated} ledger entries to the new global key format.")
@@ -588,6 +633,11 @@ def main():
 
     pending = []          # rows that are new AND not already in the ledger
     seen_this_run = set() # guards against the same URL arriving from two repos
+    # Snapshots are held back until delivery is confirmed. Advancing a
+    # snapshot past a posting that never made it to Discord would hide the
+    # row from the next run's diff, and the ledger wouldn't catch it either
+    # because an undelivered posting is deliberately never recorded there.
+    snapshots = {}        # state_file -> new file text, written at the end
 
     for repo, path, mode in SOURCES:
         label = source_id(repo, path)
@@ -603,7 +653,7 @@ def main():
         if seeding:
             for row in rows:
                 ledger[ledger_key(repo, row)] = now
-            state_file.write_text(new_text, encoding="utf-8")
+            write_snapshot(state_file, new_text)
             print(f"Seeded {len(rows):4} postings from {label}")
             continue
 
@@ -629,9 +679,9 @@ def main():
             print(f"{label}: skipped {skipped} row(s) already known.")
 
         for row in unsent:
-            pending.append({"repo": repo, "label": label, "row": row})
+            pending.append({"repo": repo, "label": label, "row": row, "state_file": state_file})
 
-        state_file.write_text(new_text, encoding="utf-8")
+        snapshots[state_file] = new_text
 
     if seeding:
         save_ledger(ledger)
@@ -639,40 +689,58 @@ def main():
         return
 
     # Flood valve: a huge jump almost always means a repo changed its link
-    # format, not that 200 jobs opened at once. Record them all so they
-    # can't fire again later, but send a single heads-up.
+    # format, not that 200 jobs opened at once. Send them all, but as one
+    # compact list rather than a few hundred individual cards.
     if len(pending) > FLOOD_THRESHOLD:
         by_repo = {}
         for item in pending:
             k = item.get("label") or item["repo"]
             by_repo[k] = by_repo.get(k, 0) + 1
         breakdown = ", ".join(f"{r}: {n}" for r, n in by_repo.items())
-        send_compact_list(pending, (
+        delivered = send_compact_list(pending, (
             f"{len(pending)} postings looked new this run ({breakdown}). That usually means a "
             "repo changed its link format rather than a real surge. Listing them compactly "
             "below rather than as individual cards \u2014 nothing has been dropped."
         ))
         print(f"FLOOD GUARD: {len(pending)} rows exceeded threshold of {FLOOD_THRESHOLD}; sent as a compact list.")
     else:
-        send_jobs_to_discord(pending)
+        delivered = send_jobs_to_discord(pending)
 
-    # Mark everything handled this run as notified, and log it, whether it
-    # went out individually or was rolled into the spike summary.
-    if pending:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            for item in pending:
-                repo, row = item["repo"], item["row"]
-                ledger[ledger_key(repo, row)] = now
-                f.write(json.dumps({
-                    "repo": repo,
-                    "source": item.get("label"),
-                    "cells": row["cells"],
-                    "link": row["link"],
-                    "seen_at": now,
-                }) + "\n")
+    # Only what Discord actually accepted goes in the ledger. The rest is
+    # left untouched on purpose so the next run picks it up again -- these
+    # are the same objects that went into `pending`, hence the identity set.
+    delivered_ids = {id(item) for item in delivered}
+    stale_sources = {item["state_file"] for item in pending if id(item) not in delivered_ids}
+
+    if delivered:
+        for item in delivered:
+            ledger[ledger_key(item["repo"], item["row"])] = now
+        if not DRY_RUN:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                for item in delivered:
+                    row = item["row"]
+                    f.write(json.dumps({
+                        "repo": item["repo"],
+                        "source": item.get("label"),
+                        "cells": row["cells"],
+                        "link": row["link"],
+                        "seen_at": now,
+                    }) + "\n")
 
     save_ledger(ledger)
-    print(f"Done. {len(pending)} new posting(s) this run. Ledger holds {len(ledger)} known postings.")
+
+    # A source holding undelivered postings keeps its old snapshot, so the
+    # next run re-detects them. Sources that fully delivered move forward.
+    for state_file, text in snapshots.items():
+        if state_file in stale_sources:
+            continue
+        write_snapshot(state_file, text)
+
+    undelivered = len(pending) - len(delivered)
+    if undelivered:
+        print(f"::warning::{undelivered} posting(s) could not be delivered to Discord. They were "
+              f"left out of the ledger and {len(stale_sources)} snapshot(s) held back so the next run retries them.")
+    print(f"Done. {len(delivered)} posting(s) sent this run. Ledger holds {len(ledger)} known postings.")
 
 
 if __name__ == "__main__":
