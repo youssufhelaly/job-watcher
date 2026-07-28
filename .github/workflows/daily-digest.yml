@@ -1,0 +1,24 @@
+name: Daily internship rundown
+
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 9am Eastern (UTC-4); adjust for your timezone / DST
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Send daily digest
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python daily_digest.py

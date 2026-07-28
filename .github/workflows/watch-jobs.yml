@@ -1,0 +1,57 @@
+name: Watch for new internship postings
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch: {}     # lets you trigger a manual test run from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated snapshot state
+
+# At 15-minute intervals a slow run could still be going when the next
+# one starts, and two jobs committing state at once is exactly the race
+# that causes duplicate alerts. Queue them instead of running in parallel.
+concurrency:
+  group: job-watcher-state
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Check repos for new postings
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python check_jobs.py
+
+      - name: Save updated snapshot state
+        run: |
+          git config user.name "job-watcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/
+          git diff --staged --quiet && echo "No state changes to commit." && exit 0
+          git commit -m "Update job snapshot state [skip ci]"
+          # Retry on the classic race: a manual run and the hourly run
+          # finishing at once. Without this the push fails, state never
+          # saves, and the next run re-detects the same postings.
+          for i in 1 2 3; do
+            if git push; then
+              echo "State pushed on attempt $i."
+              exit 0
+            fi
+            echo "Push failed (attempt $i), rebasing and retrying..."
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            sleep 5
+          done
+          echo "::error::Could not push state after 3 attempts. The notified-ledger will still prevent duplicate alerts, but check the repo."
+          exit 1
