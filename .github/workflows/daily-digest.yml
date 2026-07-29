@@ -1,8 +1,14 @@
 name: Daily internship rundown
 
+# PARKED -- the digest does not run on its own. The instant per-posting
+# cards cover the same ground, so a second daily summary is just a
+# duplicate ping. Kept because daily_digest.py still works: run it by
+# hand from the Actions tab whenever you want a rundown.
+#
+# To bring it back, uncomment the schedule below.
 on:
-  schedule:
-    - cron: "0 13 * * *"   # 9am Eastern (UTC-4); adjust for your timezone / DST
+  # schedule:
+  #   - cron: "0 13 * * *"   # 9am Eastern (UTC-4); adjust for DST
   workflow_dispatch: {}
 
 jobs:
