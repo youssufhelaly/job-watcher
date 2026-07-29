@@ -2,8 +2,7 @@
 
 Watches up to four GitHub repos (the "who's hiring" README-table style
 repos, e.g. SimplifyJobs/Summer-Internships and similar) for newly added
-postings, and pushes a phone notification for each one — plus an
-optional daily rundown.
+postings, and pushes a phone notification for each one.
 
 Tested against a real repo's live data while building this, so the
 core logic (fetch → detect new rows → notify) is confirmed working.
@@ -45,9 +44,12 @@ within seconds:
   run the flood valve takes over and sends one compact list instead —
   that many rows at once almost always means a repo changed its link
   format, and it isn't something you'd triage anyway.
-- `daily_digest.py` (optional, separate workflow) reads everything
-  found in the last 24 hours and sends one morning summary instead of
-  / in addition to the instant pushes.
+- `daily_digest.py` reads everything found in the last 24 hours and
+  sends one morning summary. **Currently parked** — its schedule is
+  commented out in `.github/workflows/daily-digest.yml`, since the
+  instant cards already cover the same postings and a daily recap on
+  top is a duplicate ping. The script still works; run it by hand from
+  the Actions tab, or uncomment the `cron:` to bring it back.
 - State (which postings have already been seen) is committed back into
   the repo after each run, so there's no external database needed.
 
@@ -306,7 +308,7 @@ Two format quirks, both handled automatically:
 - Run **"Watch for new internship postings"** manually once (Actions tab → select it → "Run workflow"). First run just saves a baseline — you won't get notifications yet, that's expected.
 - Confirm the first run posted nothing and created `state/notified.json` — that's the seed pass working correctly.
 - To verify Discord is wired up, delete a few lines from any file in `state/` (and remove the matching entries from `state/notified.json`), commit, then re-run the workflow — those postings should appear in your channel within a minute.
-- The daily rundown is a separate workflow on its own schedule (default 9am Eastern) — edit the `cron:` line in `.github/workflows/daily-digest.yml` for your preferred time.
+- The daily rundown is parked and will not run. To turn it on, uncomment the `schedule:` block in `.github/workflows/daily-digest.yml` and set your preferred time.
 
 ### 5. Deploy the scheduler
 
@@ -383,9 +385,10 @@ cd worker && npx wrangler secret put GITHUB_TOKEN   # paste the new PAT
 
 No redeploy needed. Then delete the old token on GitHub.
 
-**The daily digest still uses a GitHub `cron:`.** Once-a-day timing tolerates
-hours of slop, and it has fired on schedule, so it isn't worth a second
-trigger.
+**The daily digest needs no trigger.** Its schedule is commented out, so
+nothing fires it — run it from the Actions tab when you want it. If you
+ever re-enable the `cron:`, note that once-a-day timing tolerates hours
+of slop, so it doesn't need the Worker.
 
 ## Duplicates vs missed postings
 
@@ -464,8 +467,9 @@ postings already live across your four repos. Alerts start next run.
   alerts your Discord channel, but no postings are checked until you rotate
   it. Set a calendar reminder for a week before the expiry you chose.
 - GitHub auto-disables *scheduled* workflows after 60 days of zero repo
-  activity. Doesn't apply to `watch-jobs.yml` (no schedule), and the daily
-  digest is kept alive by the state commits every run.
+  activity. Neither workflow has a schedule any more — `watch-jobs.yml`
+  is dispatched by the Worker and the digest is parked — so it can't
+  affect either one.
 - Anyone holding the Discord webhook URL can post to that channel.
   Keep it in GitHub Secrets; if it ever leaks, delete the webhook in
   Discord and create a new one.
