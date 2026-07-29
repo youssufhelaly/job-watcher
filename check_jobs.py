@@ -1024,6 +1024,26 @@ def build_job_embed(repo: str, row: dict, label: str | None = None,
     return embed
 
 
+# Phone push notifications show a message's CONTENT. Embed titles and
+# fields don't reliably make it into the notification -- an embed-only
+# message pushes as a bare "sent a message" -- so the company and role go
+# in the content as well, and the card repeats them for the desktop view.
+#
+# Deliberately no markdown: bold survives in-channel but some clients
+# show the raw asterisks in the notification itself, and a push that
+# reads "**Meta** — ..." is worse than a plain one. Kept short because
+# lock screens truncate around 100 characters.
+MAX_PUSH_LINE = 150
+
+
+def push_line(item: dict) -> str:
+    """The one line you'll read on your phone: company, then role."""
+    cells = item["row"]["cells"]
+    company = (cells[0] if cells else "").strip() or "Unknown"
+    role = (cells[1] if len(cells) > 1 else "").strip() or "New posting"
+    return _clip(f"{company} — {role}", MAX_PUSH_LINE)
+
+
 def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
     """Post every new job as its own Discord card, one per message.
 
@@ -1045,9 +1065,8 @@ def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
             components = build_apply_button(batch[0]["row"])
             if components:
                 payload["components"] = components
-        if i == 0:
-            n = len(pending)
-            payload["content"] = _clip(f"**{n} new posting{'s' if n != 1 else ''}**", MAX_CONTENT)
+        if len(batch) == 1:
+            payload["content"] = push_line(batch[0])
 
         # want_message: the reactions need the id of the card just posted.
         message = _post_discord(payload, want_message=bool(DISCORD_BOT_TOKEN))

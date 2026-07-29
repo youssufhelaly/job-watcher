@@ -17,7 +17,10 @@
       "Bash(rm -rf /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig)",
       "Bash(mkdir -p /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/state)",
       "Bash(cp /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/cj_head_fillfirst.py /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/check_jobs.py)",
-      "Bash(cp /Users/helaly/repos/job-watcher/state/notified.json /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/state/)"
+      "Bash(cp /Users/helaly/repos/job-watcher/state/notified.json /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/state/)",
+      "Bash(awk '/^def _add_triage_reactions/,/^def build_apply_button/')",
+      "Bash(python3 -c \"import ast;ast.parse\\(open\\('diagnose_discord.py'\\).read\\(\\)\\);print\\('syntax OK'\\)\")",
+      "Bash(DISCORD_BOT_TOKEN= DISCORD_CHANNEL_ID= python3 diagnose_discord.py)"
     ]
   }
 }
