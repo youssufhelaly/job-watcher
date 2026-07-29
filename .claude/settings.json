@@ -6,7 +6,18 @@
       "Bash(curl -s \"https://api.github.com/repos/youssufhelaly/job-watcher/actions/runs?per_page=4\")",
       "Bash(python3 -c ' *)",
       "Bash(python3 -c \"import requests, bs4; print\\('deps ok', bs4.__version__\\)\")",
-      "Bash(grep -oE '<td>🔒</td>|href=\"[^\"]{0,80}')"
+      "Bash(grep -oE '<td>🔒</td>|href=\"[^\"]{0,80}')",
+      "Bash(curl -s \"https://api.github.com/repos/youssufhelaly/job-watcher/actions/runs?per_page=6\")",
+      "Bash(python3 -c \"import check_jobs\")",
+      "Bash(rm -rf /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback/state)",
+      "Bash(cp /Users/helaly/repos/job-watcher/check_jobs.py /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback/)",
+      "Bash(cp /Users/helaly/repos/job-watcher/state/notified.json /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback/state/)",
+      "Bash(env -u DISCORD_WEBHOOK_URL -u DISCORD_BOT_TOKEN -u DISCORD_CHANNEL_ID timeout 300 python3 check_jobs.py)",
+      "Bash(rm -rf /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/state)",
+      "Bash(cp /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/cj_head_fillfirst.py /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/check_jobs.py)",
+      "Bash(cp /Users/helaly/repos/job-watcher/state/notified.json /private/tmp/claude-501/-Users-helaly-repos-job-watcher/43cb4c23-6ab4-414a-b954-803cfb9b0901/scratchpad/fallback_nomig/state/)"
     ]
   }
 }

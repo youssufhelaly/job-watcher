@@ -154,9 +154,29 @@ def excluded_role(role: str) -> str | None:
     return None
 
 
+# "Internship application is closed" in both Simplify's and vanshb03's
+# legends. Worth dropping for two reasons, and the second one is not
+# obvious: the marker does not sit ALONGSIDE the apply link, it REPLACES
+# it. So a row changes identity the moment it closes -- ledger_key falls
+# off its URL branch onto the repo-scoped text branch, the ledger has no
+# record of that second key, and the posting is announced again at
+# exactly the moment it stops being applicable.
+#
+# find_new_rows filters both snapshots, so a row closing now registers as
+# neither an addition nor a removal -- it just goes quiet. And if it
+# reopens, the link comes back, the key reverts to the URL already sitting
+# in the ledger, and it stays suppressed.
+CLOSED_MARKER = "\U0001F512"          # 🔒
+
+
 def keep_row(row: dict, mode: str) -> bool:
     cells = row.get("cells") or []
     role = cells[1] if len(cells) > 1 else ""
+
+    # Checked across every cell, not just the role: these repos put the
+    # marker in whichever column held the apply link.
+    if any(CLOSED_MARKER in c for c in cells):
+        return False
 
     if excluded_role(role):
         return False
@@ -573,16 +593,24 @@ def extract_rows(text: str) -> list[dict]:
     rows = html_rows if html_rows else extract_rows_markdown(text)
     rows = _disambiguate_keys(rows)
 
-    # Pin the role signature to the row AS PARSED, because ledger_key
-    # computes it from the company cell at notify time -- so filling in a
-    # "↳" below would silently rewrite the key of every evergreen-link
-    # posting and re-announce it. Filling first and keying second would
-    # give a marginally stronger signature; keeping keys stable is worth
-    # more than that.
+    # The signature as the row was PARSED, with "↳" still in the company
+    # cell. No longer the identity -- kept only so ledger entries written
+    # before the fill-then-key switch can be recognised and carried
+    # forward instead of re-announced. See legacy_ledger_key.
+    for row in rows:
+        row["sig_legacy"] = role_signature(row)
+
+    # Resolve "↳" FIRST, then pin the signature, so a row keeps one
+    # identity whether upstream spells the company out or abbreviates it
+    # as a continuation. Upstream flips that cell freely: Simplify writes
+    # "↳" only while a row sits directly under its company, so any
+    # re-sort rewrites it -- and keying off the raw cell turned every
+    # re-sort into a false "new posting" alert.
+    rows = _fill_continuation_companies(rows)
     for row in rows:
         row["sig"] = role_signature(row)
 
-    return _fill_continuation_companies(rows)
+    return rows
 
 
 def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all") -> list[dict]:
@@ -704,6 +732,31 @@ def ledger_key(repo: str, row: dict) -> str:
     # by hand (tests) that never went through extract_rows.
     sig = row.get("sig") or role_signature(row)
     return f"{url}#{sig}"                           # evergreen page: add role
+
+
+def legacy_ledger_key(repo: str, row: dict) -> str | None:
+    """The key this row carried while "↳" was still keyed on literally.
+
+    Returns None when the old and new forms agree, which is the common
+    case -- only an evergreen link whose company cell was written as a
+    continuation marker is affected. Callers use this to recognise an
+    already-announced posting whose key has since changed, rather than
+    announcing it a second time.
+
+    Unlike migrate_ledger this can't be a blind pass over the ledger: the
+    old and new keys are only relatable through the row that produced
+    them, so it needs the parsed row in hand.
+    """
+    link = row.get("link")
+    if not link:
+        return None                     # text keys never included the signature
+    url = normalize_url(link)
+    if JOB_ID_RE.search(url):
+        return None                     # requisition keys never included it either
+    legacy = row.get("sig_legacy")
+    if not legacy or legacy == row.get("sig"):
+        return None
+    return f"{url}#{legacy}"
 
 
 def migrate_ledger(ledger: dict) -> tuple[dict, int]:
@@ -1108,6 +1161,7 @@ def main():
     # row from the next run's diff, and the ledger wouldn't catch it either
     # because an undelivered posting is deliberately never recorded there.
     snapshots = {}        # state_file -> new file text, written at the end
+    relabelled = 0        # ledger entries moved onto the post-"↳" key format
 
     for repo, path, mode in SOURCES:
         label = source_id(repo, path)
@@ -1141,6 +1195,14 @@ def main():
         for r in candidates:
             k = ledger_key(repo, r)
             if k in ledger or k in seen_this_run:
+                continue
+            # Recorded under the pre-"↳" key format? Then it HAS been
+            # announced. Move the record onto the current key so this run
+            # stays quiet and the next one doesn't have to look again.
+            legacy = legacy_ledger_key(repo, r)
+            if legacy and legacy in ledger:
+                ledger[k] = ledger.pop(legacy)
+                relabelled += 1
                 continue
             seen_this_run.add(k)   # same job in two lists -> announce once
             unsent.append(r)
@@ -1213,6 +1275,8 @@ def main():
     if undelivered:
         print(f"::warning::{undelivered} posting(s) could not be delivered to Discord. They were "
               f"left out of the ledger and {len(stale_sources)} snapshot(s) held back so the next run retries them.")
+    if relabelled:
+        print(f"Carried {relabelled} ledger entr(ies) onto the resolved-continuation key format.")
     print(f"Done. {len(delivered)} posting(s) sent this run. Ledger holds {len(ledger)} known postings.")
 
 
