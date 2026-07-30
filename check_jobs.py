@@ -60,7 +60,11 @@ from bs4 import BeautifulSoup
 # the README is linked as the "main" one. Watching just the README there
 # would miss roughly 85% of the repo.
 SOURCES = [
-    ("SimplifyJobs/Summer2026-Internships", "README.md",       "all"),
+    # Renamed from Summer2026-Internships when the season rolled over on
+    # 2026-07-29. GitHub 301s the old name, so the fetch kept working and
+    # the swap was invisible until 76 rows looked new at once -- pin the
+    # current name so the source label matches what the rows actually are.
+    ("SimplifyJobs/Summer2027-Internships", "README.md",       "all"),
     ("vanshb03/Summer2027-Internships",     "README.md",       "all"),
 
     ("speedyapply/2027-SWE-College-Jobs",   "README.md",       "all"),
@@ -407,6 +411,42 @@ def source_id(repo: str, path: str) -> str:
     return short if stem.upper() == "README" else f"{short}/{stem}"
 
 
+_RENAME_WARNED = set()
+
+
+def _warn_if_renamed(resp, owner_repo: str, headers: dict) -> None:
+    """Flag a source whose repo has been renamed out from under it.
+
+    GitHub answers 301 for a renamed repo and requests follows it, so the
+    call returns 200 carrying a DIFFERENT list's contents. Nothing
+    downstream can notice: the rows simply look new, and the flood valve
+    can only report that something changed, not what. This is how
+    SimplifyJobs/Summer2026-Internships -> Summer2027-Internships went
+    unseen until 76 postings arrived at once on 2026-07-29.
+
+    Diagnostic only -- the fetch still returns the redirected content,
+    because dropping it would be worse than labelling it imprecisely.
+    Fixing it properly means editing SOURCES and renaming the state file,
+    which can't be guessed safely: rename the wrong one and you either
+    re-announce a whole list or silently stop watching it.
+    """
+    if not resp.history or owner_repo in _RENAME_WARNED:
+        return
+    _RENAME_WARNED.add(owner_repo)
+    # The redirect lands on an ID-based URL (/repositories/12345), which
+    # doesn't name the new repo -- so ask that URL what it's called now.
+    # Only ever one extra request, and only on the rename path.
+    actual = ""
+    try:
+        base = resp.url.split("/contents/", 1)[0]
+        actual = requests.get(base, headers=headers, timeout=30).json().get("full_name", "")
+    except Exception:
+        pass
+    print(f"::warning::{owner_repo} redirected to {actual or 'another repo'}. If it was "
+          f"renamed, update SOURCES and rename its state file -- until then this source's "
+          f"rows come from a different list than its label says.")
+
+
 def fetch_file(owner_repo: str, path: str) -> str:
     """Fetch one file from a repo, trying the API first then the raw CDN."""
     headers = {"Accept": "application/vnd.github.raw+json"}
@@ -417,6 +457,7 @@ def fetch_file(owner_repo: str, path: str) -> str:
             f"{GITHUB_API}/repos/{owner_repo}/contents/{path}", headers=headers, timeout=30
         )
         resp.raise_for_status()
+        _warn_if_renamed(resp, owner_repo, headers)
         text = resp.text
         if text.lstrip().startswith(("#", "<", "!", "[", "|")):
             return text
@@ -424,6 +465,9 @@ def fetch_file(owner_repo: str, path: str) -> str:
         return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
     except Exception:
         # Unauthenticated API calls get rate limited fast; the CDN doesn't.
+        # No rename check needed on this route: raw.githubusercontent does
+        # NOT redirect a renamed repo, it 404s -- so a rename surfaces here
+        # as an ordinary fetch failure, which the caller already reports.
         for branch in ("main", "master"):
             r = requests.get(
                 f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{path}", timeout=30
@@ -825,7 +869,7 @@ BUTTON_STYLE_LINK = 5
 # notified that nobody ever received.
 DRY_RUN = not (DISCORD_WEBHOOK or POST_AS_BOT)
 DISCORD_COLORS = {
-    "SimplifyJobs/Summer2026-Internships": 0x5865F2,   # blurple
+    "SimplifyJobs/Summer2027-Internships": 0x5865F2,   # blurple
     "vanshb03/Summer2027-Internships": 0x57F287,       # green
     "speedyapply/2027-SWE-College-Jobs": 0xFEE75C,     # yellow
     "speedyapply/2027-AI-College-Jobs": 0xEB459E,      # pink
@@ -1239,9 +1283,11 @@ def main():
         print(f"Ledger seeded with {len(ledger)} postings. Future runs will notify only on genuinely new ones.")
         return
 
-    # Flood valve: a huge jump almost always means a repo changed its link
-    # format, not that 200 jobs opened at once. Send them all, but as one
-    # compact list rather than a few hundred individual cards.
+    # Flood valve: a huge jump is usually structural -- a repo rewriting
+    # its links, or a list renamed/replaced wholesale (see SOURCES) -- but
+    # it can also be a real season opening, and nothing here can tell the
+    # two apart. So send them all either way, as one compact list rather
+    # than a few hundred individual cards.
     if len(pending) > FLOOD_THRESHOLD:
         by_repo = {}
         for item in pending:
@@ -1249,9 +1295,11 @@ def main():
             by_repo[k] = by_repo.get(k, 0) + 1
         breakdown = ", ".join(f"{r}: {n}" for r, n in by_repo.items())
         delivered = send_compact_list(pending, (
-            f"{len(pending)} postings looked new this run ({breakdown}). That usually means a "
-            "repo changed its link format rather than a real surge. Listing them compactly "
-            "below rather than as individual cards \u2014 nothing has been dropped."
+            f"{len(pending)} postings looked new this run ({breakdown}). Could be a real surge "
+            "(a season opening), or a repo rewriting its links, or a list being renamed or "
+            "replaced wholesale \u2014 this run can't tell which. Every one of them is genuinely "
+            "unannounced either way, so they are all below, compactly rather than as individual "
+            "cards. Nothing has been dropped."
         ))
         print(f"FLOOD GUARD: {len(pending)} rows exceeded threshold of {FLOOD_THRESHOLD}; sent as a compact list.")
     else:

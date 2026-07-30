@@ -249,7 +249,7 @@ so watching just the README would have missed most of two repos.
 
 | Source | File | Kept | Postings |
 | --- | --- | --- | --- |
-| SimplifyJobs/Summer2026-Internships | README | all | 231 |
+| SimplifyJobs/Summer2027-Internships | README | all | 99 |
 | vanshb03/Summer2027-Internships | README | all | 144 |
 | speedyapply/2027-SWE-College-Jobs | README (USA) | all | 155 |
 | speedyapply/2027-SWE-College-Jobs | INTERN_INTL | all | 244 |
