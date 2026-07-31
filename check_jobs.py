@@ -970,8 +970,10 @@ def migrate_ledger(ledger: dict) -> tuple[dict, int]:
 #
 # One job per message costs more requests, but a reaction attaches to a
 # MESSAGE, not to an embed -- so triage marks (applied / no / save) are
-# meaningless on a ten-job card. The flood path below still batches,
-# because a 200-row false positive is noise nobody triages anyway.
+# meaningless on a ten-job card, and so is a single Apply button. Every
+# posting therefore goes out solo, with no batched path for large runs:
+# volume is held down by MAX_AGE_DAYS instead, and send_jobs_to_discord
+# paces itself between messages.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
 EMBEDS_PER_MESSAGE = 1
@@ -1264,65 +1266,6 @@ def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
     return delivered
 
 
-def _compact_line(item: dict) -> str:
-    cells = item["row"]["cells"]
-    company = cells[0] if cells else "?"
-    role = cells[1] if len(cells) > 1 else ""
-    link = item["row"].get("link")
-    label = f"**{company}** — {role}".strip(" —")
-    return f"{label} — <{link}>" if link else label
-
-
-def send_compact_list(pending: list[dict], reason: str) -> list[dict]:
-    """Deliver a large batch as compact text lines rather than rich cards.
-
-    Used when a run turns up an unusual number of postings. Rich embeds
-    would mean dozens of messages; this keeps the volume manageable
-    WITHOUT dropping anything, because a missed posting is worse than a
-    noisy channel.
-
-    Returns the items that actually reached Discord, same contract as
-    send_jobs_to_discord.
-    """
-    delivered = []
-
-    _post_discord({
-        "embeds": [{
-            "title": "Job watcher: unusual spike",
-            "description": _clip(reason, 4096),
-            "color": 0xED4245,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }]
-    })
-
-    # Pack lines into embed descriptions (4096 cap each, 6000 per message).
-    # Items travel alongside their rendered line so a failed chunk leaves
-    # exactly those postings out of the delivered set.
-    chunk, size = [], 0
-    def flush():
-        nonlocal chunk, size
-        if not chunk:
-            return
-        body = "\n".join(_compact_line(item) for item in chunk)
-        # No triage emoji on the flood path: one message carries many
-        # postings there, so a reaction on it wouldn't mean anything.
-        if _post_discord({"embeds": [{"description": body, "color": 0x99AAB5}]}) is not None:
-            delivered.extend(chunk)
-        else:
-            print(f"Compact chunk of {len(chunk)} posting(s) failed to send; they will be retried next run.")
-        chunk, size = [], 0
-        time.sleep(1.2)
-
-    for item in pending:
-        line_len = len(_compact_line(item)) + 1
-        if size + line_len > 3800:
-            flush()
-        chunk.append(item)
-        size += line_len
-    flush()
-    return delivered
-
-
 # ---------------------------------------------------------------------------
 # 5. Main
 # ---------------------------------------------------------------------------
@@ -1432,27 +1375,31 @@ def main():
         print(f"Ledger seeded with {len(ledger)} postings. Future runs will notify only on genuinely new ones.")
         return
 
-    # Flood valve: a huge jump is usually structural -- a repo rewriting
-    # its links, or a list renamed/replaced wholesale (see SOURCES) -- but
-    # it can also be a real season opening, and nothing here can tell the
-    # two apart. So send them all either way, as one compact list rather
-    # than a few hundred individual cards.
+    # An unusual count still gets one heads-up first, because a spike can
+    # mean a repo rewrote its links or a list was renamed or replaced
+    # wholesale rather than a genuine hiring surge, and this run can't tell
+    # which. It no longer changes HOW the postings are sent -- they follow
+    # as individual cards either way, same as any other run.
     if len(pending) > FLOOD_THRESHOLD:
         by_repo = {}
         for item in pending:
             k = item.get("label") or item["repo"]
             by_repo[k] = by_repo.get(k, 0) + 1
         breakdown = ", ".join(f"{r}: {n}" for r, n in by_repo.items())
-        delivered = send_compact_list(pending, (
-            f"{len(pending)} postings looked new this run ({breakdown}). Could be a real surge "
-            "(a season opening), or a repo rewriting its links, or a list being renamed or "
-            "replaced wholesale \u2014 this run can't tell which. Every one of them is genuinely "
-            "unannounced either way, so they are all below, compactly rather than as individual "
-            "cards. Nothing has been dropped."
-        ))
-        print(f"FLOOD GUARD: {len(pending)} rows exceeded threshold of {FLOOD_THRESHOLD}; sent as a compact list.")
-    else:
-        delivered = send_jobs_to_discord(pending)
+        _post_discord({"embeds": [{
+            "title": "Job watcher: unusual spike",
+            "description": _clip(
+                f"{len(pending)} postings looked new this run ({breakdown}). Could be a real "
+                "surge, or a repo rewriting its links, or a list being renamed or replaced "
+                "wholesale \u2014 this run can't tell which. They follow individually below. "
+                "Nothing has been dropped.", 4096),
+            "color": 0xED4245,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]})
+        print(f"FLOOD GUARD: {len(pending)} rows exceeded threshold of {FLOOD_THRESHOLD}; "
+              "sent a heads-up, then every posting as its own card.")
+
+    delivered = send_jobs_to_discord(pending)
 
     # Only what Discord actually accepted goes in the ledger. The rest is
     # left untouched on purpose so the next run picks it up again -- these
