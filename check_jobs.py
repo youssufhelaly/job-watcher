@@ -33,7 +33,7 @@ import re
 import json
 import base64
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 from pathlib import Path
 
@@ -395,6 +395,75 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # auto-provided inside GitHub Act
 FLOOD_THRESHOLD = int(os.environ.get("FLOOD_THRESHOLD", "50"))
 
 AGE_CELL_RE = re.compile(r"^\d+\s*(d|day|days|h|hr|hrs|hour|hours|mo|month|months|w|wk|week|weeks)$", re.I)
+
+# Only postings this fresh are worth an alert. Being new to a LIST is not
+# the same as being newly posted: these repos backfill heavily. On
+# 2026-07-31 speedyapply added 68 rows in one pass, of which 13 had gone
+# up within a day, 40 within four days, and 15 were over a week old --
+# one of them 105 days. Age comes straight from each list's own last
+# column, so the cutoff is on when the employer posted, not on when the
+# scraper noticed.
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "2"))
+
+# "3d", "10h", "2mo" (Simplify, speedyapply) ...
+_AGE_RELATIVE = re.compile(r"^(\d+)\s*([a-z]+)$", re.I)
+_AGE_UNIT_DAYS = {
+    "h": 0, "hr": 0, "hrs": 0, "hour": 0, "hours": 0,
+    "d": 1, "day": 1, "days": 1,
+    "w": 7, "wk": 7, "week": 7, "weeks": 7,
+    "mo": 30, "month": 30, "months": 30,
+}
+# ... and "Jul 24" (vanshb03, whose column is literally "Date Posted").
+_AGE_DATE = re.compile(r"^([a-z]{3,9})\.?\s+(\d{1,2})$", re.I)
+_AGE_MONTHS = {m: i for i, m in enumerate(
+    "jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+
+
+def row_age_days(row: dict, today: date | None = None) -> int | None:
+    """How long ago the posting went up, per the list's own last column.
+
+    Returns None when that cell says neither of the two shapes above.
+    Callers must read None as "can't tell" and keep the row -- a source
+    that drops or reformats the column has to keep alerting rather than
+    fall silent, since silence here is indistinguishable from "no jobs".
+
+    Deliberately does NOT widen AGE_CELL_RE, which decides what trailing
+    cell to strip from a link-less row's identity: extending that would
+    change ledger keys and re-announce postings already sent.
+    """
+    cells = row.get("cells") or []
+    value = cells[-1].strip() if cells else ""
+
+    m = _AGE_RELATIVE.match(value)
+    if m:
+        per_unit = _AGE_UNIT_DAYS.get(m.group(2).lower())
+        return int(m.group(1)) * per_unit if per_unit is not None else None
+
+    m = _AGE_DATE.match(value)
+    if m:
+        month = _AGE_MONTHS.get(m.group(1)[:3].lower())
+        if not month:
+            return None
+        today = today or datetime.now(timezone.utc).date()
+        # The cell carries no year. A date ahead of today belongs to last
+        # year -- "Dec 15" read in January is three weeks ago, not eleven
+        # months out. One day of slack absorbs timezone skew between the
+        # list's clock and ours.
+        for year in (today.year, today.year - 1):
+            try:
+                posted = date(year, month, int(m.group(2)))
+            except ValueError:
+                return None                  # e.g. Feb 30
+            if (posted - today).days <= 1:
+                return max(0, (today - posted).days)   # tomorrow == today
+    return None
+
+
+def is_fresh(row: dict) -> bool:
+    age = row_age_days(row)
+    return age is None or age <= MAX_AGE_DAYS
+
+
 HEADER_WORDS = {
     "company", "role", "position", "title", "location", "date", "link",
     "application", "apply", "notes", "age", "posted", "sponsorship",
@@ -492,13 +561,52 @@ TRACKING_PARAMS = {
 }
 
 
+# Two lists routinely carry the SAME posting under different URL shapes.
+# Left alone each shape is its own identity, so the job is announced once
+# per shape. Observed between speedyapply and SimplifyJobs:
+#
+#   Workday  /en-US/<site>/job/...       vs  /<site>/job/...
+#   iCIMS    /jobs/<id>/<title-slug>/job vs  /jobs/<id>/job?mobile=true&...
+#   Apple    /details/<id>/<title-slug>  vs  /details/<id>-<team>
+#
+# Each rule discards only a display detail -- the locale a page renders
+# in, or a slug/suffix derived from the title -- and never the
+# requisition id. Deliberately per-host rather than a general "same host
+# plus same number is the same job": on greenhouse and lever the trailing
+# path segment IS the posting, so a generic rule would merge distinct
+# jobs and silently stop announcing them.
+_LOCALE_SEG = re.compile(r"^/[a-z]{2}-[a-z]{2}(?=/)")
+_ICIMS_JOB = re.compile(r"^/jobs/(\d+)(?:/|$)")
+_APPLE_JOB = re.compile(r"^(?:/[a-z]{2}-[a-z]{2})?/details/(\d+)")
+
+
+def _canonical_job_path(host: str, path: str) -> tuple[str, bool]:
+    """Collapse a provider's interchangeable URL forms onto one path.
+
+    Takes an already-lowercased host and path. Returns (path,
+    keep_query); the query is dropped only where the requisition id in
+    the path is the entire identity, so no rule here can merge two
+    postings that a query param would have told apart.
+    """
+    if host.endswith(".myworkdayjobs.com"):
+        return _LOCALE_SEG.sub("", path), True
+    if host.endswith(".icims.com"):
+        m = _ICIMS_JOB.match(path)
+        return (f"/jobs/{m.group(1)}", False) if m else (path, True)
+    if host == "jobs.apple.com":
+        m = _APPLE_JOB.match(path)
+        return (f"/details/{m.group(1)}", False) if m else (path, True)
+    return path, True
+
+
 def normalize_url(url: str) -> str:
     """Reduce a URL to a stable identity.
 
     Drops the fragment and tracking parameters (these repos append tags
     like ?utm_source=github-vansh-ouckah, and a maintainer rewriting
     those repo-wide would otherwise make every job look brand new), while
-    keeping any parameter that actually identifies the posting.
+    keeping any parameter that actually identifies the posting, then
+    folds the known interchangeable provider forms together.
     """
     parsed = urlparse(url.strip())
     kept = {
@@ -508,8 +616,11 @@ def normalize_url(url: str) -> str:
     host = parsed.netloc.lower()
     if host.startswith("www."):
         host = host[4:]
-    path = parsed.path.rstrip("/").lower()
-    query = urlencode(sorted((k, v[0]) for k, v in kept.items())) if kept else ""
+    path, keep_query = _canonical_job_path(host, parsed.path.rstrip("/").lower())
+    query = (
+        urlencode(sorted((k, v[0]) for k, v in kept.items()))
+        if kept and keep_query else ""
+    )
     return f"{host}{path}" + (f"?{query}" if query else "")
 
 
@@ -803,23 +914,50 @@ def legacy_ledger_key(repo: str, row: dict) -> str | None:
     return f"{url}#{legacy}"
 
 
-def migrate_ledger(ledger: dict) -> tuple[dict, int]:
-    """Convert old repo-scoped URL keys to the new global form.
+def _recanonicalize_key(key: str) -> str:
+    """Re-key a stored URL key through the current canonical form.
 
-    Earlier versions stored "owner/repo::example.com/job". Without this,
-    upgrading would make every previously-announced job look new again.
+    Works on an already-normalized key ("host/path?query" with an
+    optional "#signature"), not a URL, so it can't go through
+    normalize_url -- that would read the whole schemeless key as a path.
+    """
+    head, hash_sep, sig = key.partition("#")
+    base, _, query = head.partition("?")
+    host, slash, rest = base.partition("/")
+    path, keep_query = _canonical_job_path(host, f"/{rest}" if slash and rest else "")
+    out = host + path
+    if query and keep_query:
+        out += f"?{query}"
+    return out + (hash_sep + sig if hash_sep else "")
+
+
+def migrate_ledger(ledger: dict) -> tuple[dict, int]:
+    """Bring stored keys onto the current identity format.
+
+    Two rewrites, both of which exist so that changing how identity is
+    computed doesn't re-announce postings already sent:
+
+    1. Old repo-scoped URL keys ("owner/repo::example.com/job") become
+       global, since a linked row is now keyed by URL alone.
+    2. URL keys are re-canonicalized (see _canonical_job_path). This also
+       MERGES the pairs already stored under two provider forms -- the
+       earlier timestamp wins, being when the posting actually went out.
     """
     migrated, changed = {}, 0
     url_like = re.compile(r"^[\w.-]+\.[a-z]{2,}(/|\?|$)", re.I)
     known_repos = tuple(f"{r}::" for r in REPOS)
     for key, value in ledger.items():
+        new_key = key
         if key.startswith(known_repos):
             _repo_part, rest = key.split("::", 1)
             if url_like.match(rest):        # URL keys become global
-                migrated.setdefault(rest, value)
-                changed += 1
-                continue
-        migrated[key] = value               # text fallbacks stay repo-scoped
+                new_key = rest
+        if url_like.match(new_key):         # text fallbacks stay repo-scoped
+            new_key = _recanonicalize_key(new_key)
+        if new_key != key:
+            changed += 1
+        # Both forms of one posting can be present; keep the first sending.
+        migrated[new_key] = min(migrated[new_key], value) if new_key in migrated else value
     return migrated, changed
 
 
@@ -1214,7 +1352,8 @@ def main():
         ledger, seeding = {}, True
     ledger, migrated = migrate_ledger(ledger)
     if migrated:
-        print(f"Migrated {migrated} ledger entries to the new global key format.")
+        print(f"Migrated {migrated} ledger entries to the current key format "
+              f"({len(ledger)} distinct postings after merging duplicate URL forms).")
     now = datetime.now(timezone.utc).isoformat()
 
     pending = []          # rows that are new AND not already in the ledger
@@ -1253,6 +1392,16 @@ def main():
             # checking every current row against the ledger.
             print(f"No snapshot for {label}; falling back to full ledger comparison.")
             candidates = rows
+
+        # Drop anything the list itself says is older than the cutoff.
+        # These are never recorded in the ledger and the snapshot advances
+        # past them, so they will not resurface if MAX_AGE_DAYS is raised
+        # later -- the point is that an old posting isn't news, not that
+        # it's already been handled.
+        stale = sum(1 for r in candidates if not is_fresh(r))
+        if stale:
+            candidates = [r for r in candidates if is_fresh(r)]
+            print(f"{label}: skipped {stale} row(s) posted over {MAX_AGE_DAYS} days ago.")
 
         unsent = []
         for r in candidates:
