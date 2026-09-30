@@ -129,10 +129,37 @@ NEW_GRAD_TERMS = [
 ]
 
 
-def excluded_role(role: str) -> str | None:
+# The word "graduate" on its own, anywhere in the title or the apply
+# link's slug. Letter lookarounds, so "Undergraduate", "Graduation" and
+# "2028 Graduates" (an undergrad role aimed at a class year) all survive,
+# while "Data Analytics Graduate Internship", "Software Engineer Graduate
+# Co-op" and "Graduate Leadership Internship Program" do not. The slug
+# matters because Simplify rewrites titles: Freddie Mac's
+# "Risk-Management-Graduate-Intern" is listed as "Quantitative Risk
+# Management Intern". Only the last path segment, though -- LSEG's
+# undergrad internships all sit under a "Graduate_Careers" site.
+_GRADUATE_WORD_RE = re.compile(r"(?<![a-z])graduate(?![a-z])", re.I)
+
+# Simplify's legend: "🎓 Advanced degree required (Master's, PhD, MBA)".
+ADVANCED_DEGREE_MARKER = "\U0001F393"   # 🎓
+
+
+# A role open to undergrads is not a graduate role, even when it's also
+# open to grads: "BS/MS/PhD Intern", "Intern - Undergraduate & Master's".
+_UNDERGRAD_OK_RE = re.compile(
+    r"(?<![a-z])(undergrad(uate)?s?|bachelor'?s?|bs|b\.s\.|bsc|b\.sc\.)(?![a-z])", re.I)
+
+
+def excluded_role(role: str, link: str | None = None) -> str | None:
     """Why this role is being dropped, or None to keep it."""
-    # Grad-level overrides everything, including the intern check.
-    if EXCLUDE_GRAD_LEVEL and _GRAD_LEVEL_RE.search(role):
+    # Grad-level overrides everything, including the intern check -- except
+    # a title that says undergrads can apply.
+    if EXCLUDE_GRAD_LEVEL and not _UNDERGRAD_OK_RE.search(role) and (
+        _GRAD_LEVEL_RE.search(role)
+        or ADVANCED_DEGREE_MARKER in role
+        or _GRADUATE_WORD_RE.search(role)
+        or _GRADUATE_WORD_RE.search(urlparse(link or "").path.rstrip("/").rsplit("/", 1)[-1])
+    ):
         return "grad-level"
 
     # A title LEADING with "Graduate" means a graduate-student role in
@@ -173,16 +200,32 @@ def excluded_role(role: str) -> str | None:
 CLOSED_MARKER = "\U0001F512"          # 🔒
 
 
-def keep_row(row: dict, mode: str) -> bool:
+# Regions worth an alert. Anything else is dropped before it reaches the
+# diff, same as a closed or grad-level row. Set ALLOWED_REGIONS=all to
+# get international postings back.
+_allowed = os.environ.get("ALLOWED_REGIONS", "USA,Canada")
+ALLOWED_REGIONS = None if _allowed.strip().lower() == "all" else {
+    r.strip() for r in _allowed.split(",") if r.strip()
+}
+
+
+def keep_row(row: dict, mode: str, label: str = "") -> bool:
     cells = row.get("cells") or []
     role = cells[1] if len(cells) > 1 else ""
+    location = cells[2] if len(cells) > 2 else ""
 
     # Checked across every cell, not just the role: these repos put the
     # marker in whichever column held the apply link.
     if any(CLOSED_MARKER in c for c in cells):
         return False
 
-    if excluded_role(role):
+    if excluded_role(role, row.get("link")):
+        return False
+
+    # None means nothing -- cell, link or file name -- says where the job
+    # is. Kept: a stray foreign posting is cheaper than a missed US one.
+    region = region_of(label, location, row.get("link"))
+    if ALLOWED_REGIONS is not None and region is not None and region not in ALLOWED_REGIONS:
         return False
 
     if mode == "all":
@@ -276,17 +319,62 @@ US_STATES = {
     "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI",
     "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC",
     "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
-    "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+    "VT", "VA", "WA", "WV", "WI", "WY", "DC", "PR",
 }
 CA_PROVINCES = {"ON", "QC", "BC", "AB", "MB", "SK", "NS", "NB", "NL", "PE"}
 US_NAMES = {"USA", "US", "U.S.", "U.S.A.", "UNITED STATES"}
 
-# Placeholders, not places. Without this they'd read as "somewhere that
-# isn't a US state", which the fallback would call International.
-VAGUE_LOCATIONS = {
-    "MULTIPLE LOCATIONS", "VARIOUS", "VARIOUS LOCATIONS", "TBD", "N/A",
-    "MULTIPLE", "SEVERAL LOCATIONS", "NATIONWIDE",
-}
+# Simplify's own shorthand, which carries no state code at all.
+US_ABBREVIATIONS = {"USA", "US", "NYC", "SF", "LA"}
+
+# Capitalized names, matched case-sensitively and only required to END on
+# a word boundary. Simplify's multi-location cells lose their <br>s to
+# get_text(), so "Washington" and "Oregon" arrive as "WashingtonOregon".
+US_PLACE_NAMES = [
+    "United States", "Puerto Rico", "Alabama", "Alaska", "Arizona",
+    "Arkansas", "California", "Colorado", "Connecticut", "Delaware",
+    "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas",
+    "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts",
+    "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana",
+    "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico",
+    "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma",
+    "Oregon", "Pennsylvania", "Rhode Island", "South Carolina",
+    "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia",
+    "Washington", "Wisconsin", "Wyoming", "San Francisco", "Bay Area",
+    "Silicon Valley", "Seattle", "Boston", "Chicago", "Los Angeles",
+]
+CA_PLACE_NAMES = [
+    "Canada", "Ontario", "Quebec", "Québec", "British Columbia", "Alberta",
+    "Manitoba", "Saskatchewan", "Nova Scotia", "New Brunswick",
+    "Newfoundland", "Toronto", "Montreal", "Montréal", "Vancouver",
+    "Ottawa", "Calgary", "Edmonton", "Mississauga", "Halifax", "Winnipeg",
+    "Kitchener",
+]
+
+
+def _names_re(names: list[str]) -> re.Pattern:
+    alts = "|".join(sorted((re.escape(n) for n in names), key=len, reverse=True))
+    return re.compile(rf"(?:{alts})(?![a-z])")
+
+
+_US_NAMES_RE = _names_re(US_PLACE_NAMES)
+_CA_NAMES_RE = _names_re(CA_PLACE_NAMES)
+# A run of capitals, minus a final one that starts the next word:
+# "NYCSan Jose" gives "NYC", "Cambridge, MANYC" gives "MANYC".
+_CAPS_RUN_RE = re.compile(r"[A-Z]{2,}(?=[A-Z][a-z])|[A-Z]{2,}(?![a-z])")
+
+
+def _split_caps(run: str, vocab: set[str]) -> list[str] | None:
+    """Split "SFNYC" into ["SF", "NYC"], or None if it isn't all codes."""
+    if not run:
+        return []
+    for n in (3, 2):
+        head = run[:n]
+        if head in vocab:
+            rest = _split_caps(run[n:], vocab)
+            if rest is not None:
+                return [head] + rest
+    return None
 
 
 def _term_re(terms: list[str]) -> re.Pattern:
@@ -310,38 +398,142 @@ _GRAD_LEVEL_RE = _term_re(GRAD_LEVEL_TERMS)
 _NEW_GRAD_RE = _term_re(NEW_GRAD_TERMS)
 
 
-def _region_tags(label: str, location: str) -> list[str]:
-    """Region from the location cell, with the source file as a fallback.
+_REMOTE_RE = re.compile(r"(?<![a-z0-9])remote(?![a-z0-9])", re.I)
+
+
+# Positive evidence that a job is outside the US and Canada. A posting
+# is only dropped as International when one of these is named -- a place
+# the lists here don't recognise ("Atlanta", "Evendale") is sent anyway,
+# because a stray foreign card costs less than a hidden US one. Checked
+# AFTER the US/Canada names, so "Paris, TX" and "New Mexico" are safe.
+# Georgia is left out on purpose: it is a US state too.
+FOREIGN_COUNTRIES = [
+    "UK", "U.K.", "UAE", "United Kingdom", "England", "Scotland", "Wales",
+    "Northern Ireland", "Ireland", "France", "Germany", "Italy", "Spain",
+    "Portugal", "Netherlands", "The Netherlands", "Belgium", "Luxembourg",
+    "Switzerland", "Austria", "Denmark", "Sweden", "Norway", "Finland",
+    "Iceland", "Poland", "Czechia", "Czech Republic", "Slovakia", "Hungary",
+    "Romania", "Bulgaria", "Greece", "Croatia", "Serbia", "Slovenia",
+    "Lithuania", "Latvia", "Estonia", "Ukraine", "Belarus", "Russia",
+    "Turkey", "Türkiye", "Cyprus", "Malta", "Israel", "United Arab Emirates",
+    "Saudi Arabia", "Qatar", "Kuwait", "Bahrain", "Oman", "Jordan",
+    "Lebanon", "Egypt", "Morocco", "Tunisia", "Nigeria", "Ghana", "Kenya",
+    "South Africa", "Botswana", "Mauritius", "Ethiopia", "Rwanda", "India",
+    "Pakistan", "Bangladesh", "Sri Lanka", "Nepal", "China", "Hong Kong",
+    "Macau", "Taiwan", "Japan", "South Korea", "Korea", "Singapore",
+    "Malaysia", "Indonesia", "Thailand", "Vietnam", "Philippines",
+    "Australia", "New Zealand", "Mexico", "Brazil", "Argentina", "Chile",
+    "Colombia", "Peru", "Uruguay", "Costa Rica", "El Salvador", "Guatemala",
+    "Panama", "Dominican Republic",
+]
+# Cities that show up on their own, in cells or in Workday links.
+FOREIGN_CITIES = [
+    "London", "Shanghai", "Beijing", "Shenzhen", "Suzhou", "Bengaluru",
+    "Bangalore", "Hyderabad", "Pune", "Chennai", "Torino", "Milan",
+    "Florence", "Munich", "Berlin", "Paris", "Aberdeen", "Glasgow",
+    "Cork", "Dublin", "Madrid", "Barcelona", "Getafe", "Budapest",
+    "Amsterdam", "Warsaw", "Krakow", "Tokyo", "Seoul", "Taipei", "Zurich",
+    "Baden", "Ebene", "Dubai", "Tel Aviv",
+]
+_FOREIGN_NAMES = sorted(FOREIGN_COUNTRIES + FOREIGN_CITIES, key=len, reverse=True)
+_FOREIGN_ALTS = "|".join(re.escape(n) for n in _FOREIGN_NAMES)
+# Case-sensitive in cells so glued names still split: "London, UKCambridge".
+_FOREIGN_RE = re.compile(rf"(?<![a-z])(?:{_FOREIGN_ALTS})(?![a-z])")
+# Links shout ("IT-FI-FLORENCE-VIA..."), so there case doesn't count.
+_FOREIGN_LINK_RE = re.compile(rf"(?<![a-z])(?:{_FOREIGN_ALTS})(?![a-z])", re.I)
+# Workday puts the location right after /job/: ".../job/WI-Milwaukee/...".
+_WORKDAY_PLACE_RE = re.compile(r"/job/([^/]+)/[^/]+")
+
+
+def _us_or_canada(loc: str, province_codes: bool = True) -> str | None:
+    codes_us, codes_ca = set(), set()
+    # "Arlington, VA +2", "Boston, MASanta Clara": a code right after a
+    # comma, ending the word or glued to the next capitalized one -- but
+    # not the start of an all-caps word ("IT, FI, FLORENCE" is not FL).
+    for m in re.finditer(r",\s*([A-Z]{2})(?![A-Za-z]|[A-Z][A-Z])", loc):
+        if m.group(1) in CA_PROVINCES:
+            if province_codes:
+                codes_ca.add(m.group(1))
+        elif m.group(1) in US_STATES:
+            codes_us.add(m.group(1))
+    # Bare runs of capitals ("NYC", "SFLA", "USA +3") only count when they
+    # split cleanly into known codes, so "UK" or "UAE" can't sneak in.
+    # A lone two-letter state code with no comma ("OR", "IN") is too
+    # ambiguous to trust; one glued to a neighbour ("MANYC") is not.
+    # A foreign code glued on the front ("London, UKNYC") is skipped past.
+    for run in _CAPS_RUN_RE.findall(loc):
+        for i in range(len(run) - 1):
+            parts = _split_caps(run[i:], US_ABBREVIATIONS | US_STATES) or []
+            if (len(parts) > 1 and i == 0) or US_ABBREVIATIONS & set(parts):
+                codes_us.update(parts)
+                break
+    if re.search(r"(?<![a-z])u\.s\.(a\.)?", loc, re.I):
+        codes_us.add("US")
+
+    if codes_ca or _CA_NAMES_RE.search(loc):
+        return "Canada"
+    if codes_us or _US_NAMES_RE.search(loc):
+        return "USA"
+    return None
+
+
+def _region_from_link(link: str | None) -> str | None:
+    """Region from a Workday link's location segment, or None."""
+    m = _WORKDAY_PLACE_RE.search(urlparse(link or "").path)
+    if not m:
+        return None
+    seg = m.group(1)
+    # Foreign names first: "IN_Bangalore" would otherwise read as Indiana.
+    if _FOREIGN_LINK_RE.search(seg.replace("_", "-")):
+        return "International"
+    # "Kingwood-TX" -> "Kingwood, TX" so the comma-code rule applies.
+    # Province codes are off here: "...-Nootdorp-NL" is the Netherlands.
+    return _us_or_canada(", " + ", ".join(seg.split("-")), province_codes=False)
+
+
+def region_of(label: str, location: str, link: str | None = None) -> str | None:
+    """"USA", "Canada", "International", or None when nothing says.
 
     Location text is more trustworthy than the file name: speedyapply's
-    USA lists do carry the odd Canadian posting, and Simplify has no
-    USA/INTL split at all.
+    USA lists do carry the odd Canadian posting, its INTL lists carry the
+    odd US one, and Simplify has no USA/INTL split at all. A
+    multi-location cell naming any US (or Canadian) place counts as that
+    country -- "Dubai ... NYC" is still somewhere you can work in the US.
     """
     loc = location or ""
+    region = _us_or_canada(loc)
+    if region:
+        return region
+
+    if _FOREIGN_RE.search(loc):
+        return "International"
+
+    # Nothing recognisable in the cell -- blank, "Remote", or a place not
+    # on either list. The INTL file name is NOT enough to drop it:
+    # speedyapply's INTL lists have blank-location rows for Dow Jones in
+    # NYC, Baird in Milwaukee, CAE in Halifax. The apply link often says.
+    region = _region_from_link(link)
+    if region:
+        return region
+    if "USA" in (label or "").upper():
+        return "USA"
+    return None
+
+
+REGION_TAGS = {
+    "USA": "\U0001F1FA\U0001F1F8 USA",
+    "Canada": "\U0001F1E8\U0001F1E6 Canada",
+    "International": "\U0001F30D International",
+}
+
+
+def _region_tags(label: str, location: str, link: str | None = None) -> list[str]:
     tags = []
-
-    remote_re = re.compile(r"(?<![a-z0-9])remote(?![a-z0-9])", re.I)
-    if remote_re.search(loc):
+    if _REMOTE_RE.search(location or ""):
         tags.append("\U0001F3E0 Remote")
-    # "Remote" on its own names no country, so it must not fall through to
-    # the International guess below. "Remote, US" still has "US" to go on.
-    stripped = remote_re.sub("", loc).strip(" ,;/-")
-    named_place = bool(re.sub(r"[^a-z0-9]", "", stripped, flags=re.I)) \
-        and stripped.upper() not in VAGUE_LOCATIONS
-
-    # Trailing "..., NY" / "..., ON" is the reliable signal.
-    tail = {p.strip().upper() for p in loc.split(",")}
-    if "CANADA" in tail or tail & CA_PROVINCES:
-        tags.append("\U0001F1E8\U0001F1E6 Canada")
-    elif tail & US_STATES or tail & US_NAMES:
-        tags.append("\U0001F1FA\U0001F1F8 USA")
-    elif "INTL" in (label or "").upper():
-        tags.append("\U0001F30D International")
-    elif named_place:
-        # A place that names neither a US state nor a province is
-        # somewhere else in the world.
-        tags.append("\U0001F30D International")
-
+    region = region_of(label, location, link)
+    if region:
+        tags.append(REGION_TAGS[region])
     return tags
 
 
@@ -375,7 +567,7 @@ def classify(repo: str, label: str, row: dict) -> list[str]:
         # filed on a new-grad list and may really be full-time.
         tags.append("⚠️ Filed new-grad")
 
-    tags.extend(_region_tags(label, location))
+    tags.extend(_region_tags(label, location, row.get("link")))
     return tags
 
 
@@ -768,7 +960,8 @@ def extract_rows(text: str) -> list[dict]:
     return rows
 
 
-def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all") -> list[dict]:
+def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all",
+                  label: str = "") -> list[dict]:
     """Rows present now that weren't in the previous snapshot.
 
     Compares using ledger_key -- the SAME identity the ledger uses. If
@@ -779,10 +972,10 @@ def find_new_rows(repo: str, old_text: str, new_text: str, mode: str = "all") ->
     The filter is applied to BOTH sides, so a row that the filter
     excludes can never register as an addition or a removal.
     """
-    old_keys = {ledger_key(repo, r) for r in extract_rows(old_text) if keep_row(r, mode)}
+    old_keys = {ledger_key(repo, r) for r in extract_rows(old_text) if keep_row(r, mode, label)}
     return [
         r for r in extract_rows(new_text)
-        if keep_row(r, mode) and ledger_key(repo, r) not in old_keys
+        if keep_row(r, mode, label) and ledger_key(repo, r) not in old_keys
     ]
 
 
@@ -1317,7 +1510,7 @@ def main():
             print(f"Failed to fetch {label}: {e}")
             continue
 
-        rows = [r for r in extract_rows(new_text) if keep_row(r, mode)]
+        rows = [r for r in extract_rows(new_text) if keep_row(r, mode, label)]
 
         if seeding:
             for row in rows:
@@ -1329,7 +1522,7 @@ def main():
         # The snapshot narrows down what changed; the ledger has the final
         # say on whether it's ever been sent.
         if state_file.exists():
-            candidates = find_new_rows(repo, state_file.read_text(encoding="utf-8"), new_text, mode)
+            candidates = find_new_rows(repo, state_file.read_text(encoding="utf-8"), new_text, mode, label)
         else:
             # Snapshot lost (e.g. a state commit failed). Fall back to
             # checking every current row against the ledger.

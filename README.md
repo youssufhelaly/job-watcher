@@ -99,11 +99,27 @@ Three real titles the word lists are shaped around, all of which must
 survive: **Graduation Internship** (a thesis project, not a graduate
 role), **Undergraduate Research Intern** (the lookbehind stops "graduate
 research" matching inside it), and the two "entry level" internships
-above. Matching the bare word "graduate" would throw all of them away.
+above. So `graduate` is matched only as a whole word — letter
+lookarounds keep "Undergraduate", "Graduation" and "2028 Graduates" —
+in the title and in the last segment of the apply link, since Simplify
+often rewrites "... Graduate Intern" titles to drop the word. Simplify's
+🎓 (advanced degree required) marker drops a row too. None of that
+applies when the title also says undergrads can apply ("BS/MS/PhD
+Intern", "Intern - Undergraduate & Master's").
 
-Region comes from the location cell first and the source file second,
-because speedyapply's USA lists do carry the odd Canadian posting and
-Simplify has no USA/INTL split at all. `COMPANY_TIERS` and `ROLE_DOMAINS`
+Only USA and Canada postings are sent (`ALLOWED_REGIONS`, default
+`USA,Canada`; set it to `all` to get international ones back). Region
+comes from the location cell first and the source file second, because
+speedyapply's USA lists do carry the odd Canadian posting and Simplify
+has no USA/INTL split at all. A multi-location posting counts if any of
+its locations is in the US or Canada. A posting is only dropped when it
+positively names a foreign country or city (`FOREIGN_COUNTRIES`,
+`FOREIGN_CITIES`); a place on neither list, like a bare "Atlanta", is
+sent. When the location cell is blank or just "Remote", the Workday
+apply link's location part decides
+(`.../job/WI-Milwaukee/...`), because speedyapply's INTL lists carry
+blank-location US and Canadian postings. If nothing says where a job is,
+it is sent anyway: a stray foreign posting costs less than a missed one. `COMPANY_TIERS` and `ROLE_DOMAINS`
 in `check_jobs.py` are plain lists meant to be edited.
 
 Tags also go into `state/new_jobs_log.jsonl`, so the digest can group by
