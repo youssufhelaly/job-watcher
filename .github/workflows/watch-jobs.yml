@@ -11,9 +11,10 @@ on:
 permissions:
   contents: write   # needed so the workflow can commit the updated snapshot state
 
-# At 15-minute intervals a slow run could still be going when the next
-# one starts, and two jobs committing state at once is exactly the race
-# that causes duplicate alerts. Queue them instead of running in parallel.
+# A slow run can still be going when the next one is dispatched, and two
+# jobs committing state at once is exactly the race that causes duplicate
+# alerts. Queue them instead of running in parallel. Queuing alone isn't
+# enough, though -- see the "Start from the latest state" step.
 concurrency:
   group: job-watcher-state
   cancel-in-progress: false
@@ -23,6 +24,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # checkout@v4 checks out the commit main pointed at when the run was
+      # DISPATCHED. A run that queued behind another would start from state
+      # the first run has since replaced, and re-send everything it sent.
+      - name: Start from the latest state
+        run: |
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard FETCH_HEAD
 
       - uses: actions/setup-python@v5
         with:
@@ -47,24 +56,35 @@ jobs:
           EXCLUDE_NEW_GRAD: "1"
         run: python check_jobs.py
 
+      # always(): the script exits non-zero when it needs attention (failed
+      # deliveries, dead sources) but has saved its state first, and a run
+      # cancelled midway has already sent -- and recorded -- some cards.
+      # Skipping the commit in either case would re-send them next run.
       - name: Save updated snapshot state
+        if: always()
         run: |
           git config user.name "job-watcher-bot"
           git config user.email "actions@users.noreply.github.com"
           git add state/
           git diff --staged --quiet && echo "No state changes to commit." && exit 0
           git commit -m "Update job snapshot state [skip ci]"
-          # Retry on the classic race: a manual run and the hourly run
-          # finishing at once. Without this the push fails, state never
-          # saves, and the next run re-detects the same postings.
+          # The branch can still move under a run -- a code push while it was
+          # going. Rebase onto it; on a conflict in state/ keep THIS run's
+          # files (-X theirs is the commit being replayed), since this run
+          # started from the latest state and holds what it just sent.
           for i in 1 2 3; do
-            if git push; then
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
               echo "State pushed on attempt $i."
               exit 0
             fi
             echo "Push failed (attempt $i), rebasing and retrying..."
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git fetch origin "${GITHUB_REF_NAME}"
+            if ! git rebase -X theirs FETCH_HEAD; then
+              git rebase --abort
+              echo "::error::Rebase onto ${GITHUB_REF_NAME} failed outside state/; not retrying."
+              exit 1
+            fi
             sleep 5
           done
-          echo "::error::Could not push state after 3 attempts. The notified-ledger will still prevent duplicate alerts, but check the repo."
+          echo "::error::Could not push state after 3 attempts. This run's ledger is NOT saved, so the next run may re-send its postings."
           exit 1

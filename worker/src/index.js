@@ -8,11 +8,19 @@
 const ATTEMPTS = 3;
 const BACKOFF_MS = [2000, 5000];   // waits between attempt 1->2 and 2->3
 
+// A dead token fails the same way on every tick, and one alert per tick is
+// 48 identical pings a day. With no storage to remember "already told
+// them", those alert on the first tick of every PERSISTENT_ALERT_HOURS
+// instead. Transient failures, and anything triggered by hand, alert
+// every time.
+const PERSISTENT_ALERT_HOURS = 3;
+const PERSISTENT = new Set([401, 403, 404, "misconfigured"]);
+
 export default {
   async scheduled(event, env, ctx) {
     // waitUntil keeps the Worker alive through the retries; without it the
     // runtime can tear us down as soon as scheduled() returns.
-    ctx.waitUntil(run(env, "cron"));
+    ctx.waitUntil(run(env, "cron", event.scheduledTime));
   },
 
   async fetch(request, env) {
@@ -45,11 +53,19 @@ export default {
   },
 };
 
-async function run(env, source) {
+function shouldAlert(kind, source, scheduledTime) {
+  if (source !== "cron" || !PERSISTENT.has(kind)) return true;
+  const t = new Date(scheduledTime ?? Date.now());
+  return t.getUTCHours() % PERSISTENT_ALERT_HOURS === 0 && t.getUTCMinutes() < 30;
+}
+
+async function run(env, source, scheduledTime) {
   if (!env.GITHUB_TOKEN) {
     const error = "GITHUB_TOKEN is not set. Run: npx wrangler secret put GITHUB_TOKEN";
     log("error", { event: "misconfigured", source, error });
-    await alert(env, `job-watcher trigger is misconfigured: ${error}`);
+    if (shouldAlert("misconfigured", source, scheduledTime)) {
+      await alert(env, `job-watcher trigger is misconfigured: ${error}`);
+    }
     return { ok: false, error };
   }
 
@@ -95,7 +111,12 @@ async function run(env, source) {
     if (attempt < ATTEMPTS) await sleep(BACKOFF_MS[attempt - 1]);
   }
 
-  await alert(env, describe(env, last));
+  if (shouldAlert(last?.status, source, scheduledTime)) {
+    await alert(env, describe(env, last));
+  } else {
+    log("warn", { event: "alert_suppressed", source, status: last?.status,
+      reason: `repeat of a persistent failure; alerts every ${PERSISTENT_ALERT_HOURS}h` });
+  }
   return { ok: false, source, ...last };
 }
 
@@ -124,14 +145,23 @@ function describe(env, last) {
 }
 
 // Best-effort: a failed alert must not mask the dispatch failure in the logs.
+// But it must be LOGGED -- a dead webhook plus a dead token would otherwise
+// fail with no trace anywhere.
 async function alert(env, message) {
-  if (!env.DISCORD_WEBHOOK_URL) return;
+  if (!env.DISCORD_WEBHOOK_URL) {
+    log("error", { event: "alert_skipped", reason: "DISCORD_WEBHOOK_URL unset" });
+    return;
+  }
   try {
-    await fetch(env.DISCORD_WEBHOOK_URL, {
+    const res = await fetch(env.DISCORD_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: message.slice(0, 1900) }),
     });
+    if (!res.ok) {
+      log("error", { event: "alert_failed", status: res.status,
+        body: (await res.text()).slice(0, 300) });
+    }
   } catch (e) {
     log("error", { event: "alert_failed", error: String(e) });
   }

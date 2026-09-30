@@ -11,20 +11,50 @@ on:
   #   - cron: "0 13 * * *"   # 9am Eastern (UTC-4); adjust for DST
   workflow_dispatch: {}
 
+permissions:
+  contents: write   # commits state/digest_watermark.txt
+
+# Same group as the watcher: both commit to state/.
+concurrency:
+  group: job-watcher-state
+  cancel-in-progress: false
+
 jobs:
   digest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Start from the latest state
+        run: |
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard FETCH_HEAD
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests
+        # beautifulsoup4 because the digest reuses check_jobs' filters.
+        run: pip install requests beautifulsoup4
 
       - name: Send daily digest
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python daily_digest.py
+
+      - name: Save digest watermark
+        run: |
+          git config user.name "job-watcher-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/digest_watermark.txt 2>/dev/null || true
+          git diff --staged --quiet && echo "No watermark change." && exit 0
+          git commit -m "Update digest watermark [skip ci]"
+          for i in 1 2 3; do
+            git push origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase -X theirs FETCH_HEAD || { git rebase --abort; exit 1; }
+            sleep 5
+          done
+          echo "::error::Could not push the digest watermark; the next digest may repeat postings."
+          exit 1

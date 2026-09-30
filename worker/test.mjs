@@ -133,6 +133,26 @@ mock(() => new Response(null, { status: 204 }));
 await worker.scheduled({}, BASE_ENV, ctx);
 check("cron dispatches", calls.length === 1, `got ${calls.length}`);
 
+// --- 9b. persistent failures alert every few hours, not every tick -----
+let pending;
+const ctxWait = { waitUntil: (p) => { pending = p; } };
+const tick = async (iso) => {
+  await worker.scheduled({ scheduledTime: Date.parse(iso) }, BASE_ENV, ctxWait);
+  await pending;
+};
+mock(() => new Response("bad credentials", { status: 401 }));
+await tick("2026-10-01T03:00:00Z");
+check("401 on an alert tick -> alerts", alerts.length === 1, JSON.stringify(alerts));
+mock(() => new Response("bad credentials", { status: 401 }));
+await tick("2026-10-01T03:30:00Z");
+check("401 repeat within the window -> suppressed", alerts.length === 0, JSON.stringify(alerts));
+mock(() => new Response("bad credentials", { status: 401 }));
+await tick("2026-10-01T04:00:00Z");
+check("401 off-hour -> suppressed", alerts.length === 0, JSON.stringify(alerts));
+mock(() => new Response("bad credentials", { status: 401 }));
+await worker.fetch(post("/trigger", "Bearer s3cret"), BASE_ENV);
+check("401 on manual trigger -> always alerts", alerts.length === 1, JSON.stringify(alerts));
+
 // --- 10. status + 404 routing -----------------------------------------
 res = await worker.fetch(new Request("https://w.dev/"), BASE_ENV);
 const status = await res.json();

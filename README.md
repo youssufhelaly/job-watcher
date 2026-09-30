@@ -41,11 +41,14 @@ within seconds:
   role, location, pay, and a clickable apply link. One job per message,
   so a reaction on a message means something about that one posting
   (see [Triage](#triage)). Above `FLOOD_THRESHOLD` postings in a single
-  run the flood valve takes over and sends one compact list instead —
-  that many rows at once almost always means a repo changed its link
-  format, and it isn't something you'd triage anyway.
-- `daily_digest.py` reads everything found in the last 24 hours and
-  sends one morning summary. **Currently parked** — its schedule is
+  run you get one heads-up first — that many rows at once often means a
+  repo changed its link format — and then every posting as its own card
+  as usual. Nothing is dropped.
+- Postings that went up more than `FRESH_DAYS` (2) ago — these lists
+  backfill heavily — are still sent, tagged 🕰️ *Posted Nd ago*. Only
+  rows past `MAX_AGE_DAYS` (30) are skipped.
+- `daily_digest.py` sends one summary of everything delivered since the
+  previous digest (tracked in `state/digest_watermark.txt`). **Currently parked** — its schedule is
   commented out in `.github/workflows/daily-digest.yml`, since the
   instant cards already cover the same postings and a daily recap on
   top is a duplicate ping. The script still works; run it by hand from
@@ -66,10 +69,13 @@ cost nothing per run and can't fail a delivery.
 | Company | ⭐ FAANG · 🧪 AI lab · 📈 Quant · 🏢 Big Tech |
 | Domain | 🧠 AI/ML · 🔧 Hardware · 🔐 Security |
 | Eligibility | 🎓 PhD · ⚠️ Filed new-grad |
-| Region | 🇺🇸 USA · 🇨🇦 Canada · 🌍 International · 🏠 Remote |
+| Region | 🇺🇸 USA · 🇨🇦 Canada · 🏠 Remote (no tag when the list doesn't say) |
+| Age | 🕰️ Posted Nd ago, on backfilled postings |
 
-Measured over the postings currently in `state/`: 47% AI/ML, 50%
-International, 12% Quant. **⚠️ Filed new-grad** is the one to watch — a
+International postings are dropped by default (see below), so 🌍
+International only appears with `ALLOWED_REGIONS=all`. Company tiers
+match the start of the company name, so "H&R Block" is not Block. **⚠️
+Filed new-grad** is the one to watch — a
 row kept off a new-grad list because it read as a co-op, so it may really
 be full-time.
 
@@ -115,15 +121,21 @@ has no USA/INTL split at all. A multi-location posting counts if any of
 its locations is in the US or Canada. A posting is only dropped when it
 positively names a foreign country or city (`FOREIGN_COUNTRIES`,
 `FOREIGN_CITIES`); a place on neither list, like a bare "Atlanta", is
-sent. When the location cell is blank or just "Remote", the Workday
-apply link's location part decides
-(`.../job/WI-Milwaukee/...`), because speedyapply's INTL lists carry
-blank-location US and Canadian postings. If nothing says where a job is,
-it is sent anyway: a stray foreign posting costs less than a missed one. `COMPANY_TIERS` and `ROLE_DOMAINS`
+sent. Cities that share a name with a US town (Dublin, Aberdeen,
+Paris…) only count with their country. speedyapply shows only the first
+location and hides the rest behind "+N", so a foreign first place on a
+"+N" row proves nothing — "Yinchuan, China +1" was a Raleigh, NC
+internship — and those are sent. When the location cell is blank or just
+"Remote", the Workday apply link's location part can prove a job is in
+the US or Canada (`.../job/WI-Milwaukee/...`) but never hides one,
+because speedyapply's INTL lists carry blank-location US and Canadian
+postings. If nothing says where a job is, it is sent anyway: a stray
+foreign posting costs less than a missed one. `COMPANY_TIERS` and `ROLE_DOMAINS`
 in `check_jobs.py` are plain lists meant to be edited.
 
-Tags also go into `state/new_jobs_log.jsonl`, so the digest can group by
-them, and filtering on them later ("skip PhD-only") is a one-line change.
+Tags also go into `state/new_jobs_log.jsonl`. The digest re-applies the
+current filters to the log, so tightening a filter also cleans up the
+digest.
 
 ### The ↳ rows
 
@@ -369,7 +381,7 @@ One gotcha worth stating plainly, since it's easy to get backwards:
 reads the **value** from the prompt that follows. Passing the value as the
 argument creates a secret named after your credential — and names are not
 masked in the dashboard, the CLI, or shell history. `npm test` in `worker/` exercises the dispatch logic against a
-mocked GitHub API — 30 checks, no network or credentials needed.
+mocked GitHub API — 36 checks, no network or credentials needed.
 
 ## Scheduling
 
@@ -416,12 +428,25 @@ Three layers prevent genuine duplicates:
 
 1. **Per-repo snapshot** (`state/<repo>.txt`) — what changed since the
    last run.
-2. **Global ledger** (`state/notified.json`) — every posting ever sent.
-   A lost snapshot or failed commit can't cause a repeat.
+2. **Global ledger** (`state/notified.json`) — every posting ever sent,
+   saved after each card and written atomically, so a run that dies
+   midway keeps what it already sent. A lost snapshot can't cause a
+   repeat. If the ledger is ever unreadable it is rebuilt from the last
+   snapshots, so postings that appeared since are still announced.
 3. **Cross-repo dedupe** — the key is the application URL, not scoped
    per repo. Your repos overlap heavily (50 shared URLs; one careers
    page appears in all four), so without this you'd get some jobs four
    times.
+
+And one layer against missed postings: a card Discord doesn't accept is
+remembered in `state/undelivered.json` and retried every run, whatever
+its age, until it goes through. The run then fails (red in Actions) so
+you hear about it — as it does when a source hasn't fetched for
+`FETCH_ALERT_AFTER` runs in a row (`state/fetch_failures.json`).
+
+Runs are queued, and each one starts from the latest committed state
+rather than the commit it was dispatched at, so a run that waited behind
+another can't re-send what that one just sent.
 
 ### How identity works
 
@@ -432,6 +457,14 @@ Three layers prevent genuine duplicates:
   are folded into the key, so a *new* role behind the same page still
   alerts. Costs the occasional duplicate when two repos word a title
   differently; that's the intended trade.
+
+The same posting often appears under different URL shapes — Workday's
+per-site and per-location copies of one requisition, Greenhouse's
+`?gh_jid=` and embed forms, Ashby's `/application`, Lever's `/apply`,
+SmartRecruiters' title slugs, ByteDance's two domains, Microsoft's
+`?pid=`. Those fold onto one key (`_canonical_job_path`), and existing
+ledger entries are migrated onto it, so nothing already sent is sent
+again.
 
 Job titles are normalized before comparison (case, emoji, punctuation, a
 trailing "US", engineer/engineering) but **years and season words are
@@ -464,10 +497,9 @@ Identity is the application URL, not the season:
 | 195 postings appear at once | all 195 delivered, 9 messages |
 
 **Spike handling.** If a run turns up more than 50 apparently-new
-postings — usually a repo changing its link format — you get a warning
-followed by all of them as a compact list, roughly 40 per message
-instead of individual cards. Nothing is dropped. Tune with
-`FLOOD_THRESHOLD`.
+postings — often a repo changing its link format — you get one warning,
+then all of them as individual cards as usual. Nothing is dropped. Tune
+with `FLOOD_THRESHOLD`.
 
 **First run sends nothing.** It seeds the ledger with the ~1,221 unique
 postings already live across your four repos. Alerts start next run.
@@ -477,11 +509,12 @@ postings already live across your four repos. Alerts start next run.
 - **The 30-minute cadence depends on the Worker being deployed.** If you
   skip [step 5](#5-deploy-the-scheduler), `watch-jobs.yml` has no trigger at
   all and will only ever run when you click "Run workflow". This is the
-  deliberate trade for punctuality — see [Scheduling](#scheduling). Runs are
-  queued (not cancelled) if one overlaps the next, so nothing is skipped.
+  deliberate trade for punctuality — see [Scheduling](#scheduling). If one
+  run overlaps the next, the next waits; GitHub keeps only the newest
+  waiting run, which loses nothing since every run diffs everything.
 - **The PAT expires.** When it does, the Worker starts getting 401s and
-  alerts your Discord channel, but no postings are checked until you rotate
-  it. Set a calendar reminder for a week before the expiry you chose.
+  alerts your Discord channel (every 3 hours while it lasts, not every
+  tick), but no postings are checked until you rotate it. Set a calendar reminder for a week before the expiry you chose.
 - GitHub auto-disables *scheduled* workflows after 60 days of zero repo
   activity. Neither workflow has a schedule any more — `watch-jobs.yml`
   is dispatched by the Worker and the digest is parked — so it can't
@@ -502,9 +535,9 @@ postings already live across your four repos. Alerts start next run.
   you'll get it twice. On current data that affects about 3 postings.
   This is the deliberate trade for never missing a new role behind a
   reused careers page.
-- `state/notified.json` grows over time (~725 entries at seed, tiny).
-  Even after a full season it'll be well under a megabyte, so there's
-  nothing to prune.
+- `state/notified.json` grows over time — about 6,100 entries and 800 KB
+  by late September. A few megabytes a season is still fine to commit,
+  so there's nothing to prune.
 
 ## Want it tailored further?
 Send me the actual 4 repo URLs and I'll plug them in and sanity-check

@@ -30,8 +30,11 @@ deliver normally without it.
 
 import os
 import re
+import sys
 import json
 import base64
+import hashlib
+import tempfile
 import time
 from datetime import datetime, timezone, date
 from urllib.parse import urlparse, parse_qs, urlencode, quote
@@ -291,6 +294,9 @@ COMPANY_TIERS = [
     ]),
 ]
 
+# Companies whose name merely starts with a tier name.
+NOT_TIERED = {"cohere health", "snap finance", "snap one", "block island"}
+
 # Role-text domains. A posting can carry more than one of these.
 ROLE_DOMAINS = [
     ("\U0001F9E0 AI/ML", [
@@ -406,7 +412,8 @@ _REMOTE_RE = re.compile(r"(?<![a-z0-9])remote(?![a-z0-9])", re.I)
 # the lists here don't recognise ("Atlanta", "Evendale") is sent anyway,
 # because a stray foreign card costs less than a hidden US one. Checked
 # AFTER the US/Canada names, so "Paris, TX" and "New Mexico" are safe.
-# Georgia is left out on purpose: it is a US state too.
+# Left out on purpose because a US place shares the name: Georgia,
+# Lebanon (PA, NH), Jordan (MN), Malta (NY).
 FOREIGN_COUNTRIES = [
     "UK", "U.K.", "UAE", "United Kingdom", "England", "Scotland", "Wales",
     "Northern Ireland", "Ireland", "France", "Germany", "Italy", "Spain",
@@ -415,9 +422,8 @@ FOREIGN_COUNTRIES = [
     "Iceland", "Poland", "Czechia", "Czech Republic", "Slovakia", "Hungary",
     "Romania", "Bulgaria", "Greece", "Croatia", "Serbia", "Slovenia",
     "Lithuania", "Latvia", "Estonia", "Ukraine", "Belarus", "Russia",
-    "Turkey", "Türkiye", "Cyprus", "Malta", "Israel", "United Arab Emirates",
-    "Saudi Arabia", "Qatar", "Kuwait", "Bahrain", "Oman", "Jordan",
-    "Lebanon", "Egypt", "Morocco", "Tunisia", "Nigeria", "Ghana", "Kenya",
+    "Turkey", "Türkiye", "Cyprus", "Israel", "United Arab Emirates",
+    "Saudi Arabia", "Qatar", "Kuwait", "Bahrain", "Oman", "Egypt", "Morocco", "Tunisia", "Nigeria", "Ghana", "Kenya",
     "South Africa", "Botswana", "Mauritius", "Ethiopia", "Rwanda", "India",
     "Pakistan", "Bangladesh", "Sri Lanka", "Nepal", "China", "Hong Kong",
     "Macau", "Taiwan", "Japan", "South Korea", "Korea", "Singapore",
@@ -426,14 +432,16 @@ FOREIGN_COUNTRIES = [
     "Colombia", "Peru", "Uruguay", "Costa Rica", "El Salvador", "Guatemala",
     "Panama", "Dominican Republic",
 ]
-# Cities that show up on their own, in cells or in Workday links.
+# Cities that show up on their own. Only ones with no US namesake: a
+# bare "Dublin" could be Dublin, OH, "Aberdeen" Aberdeen, MD, and so on,
+# so London, Paris, Dublin, Cork, Aberdeen, Glasgow, Milan, Munich,
+# Berlin, Florence, Warsaw and Baden are deliberately absent. They still
+# drop when the country is named ("Dublin, Ireland").
 FOREIGN_CITIES = [
-    "London", "Shanghai", "Beijing", "Shenzhen", "Suzhou", "Bengaluru",
-    "Bangalore", "Hyderabad", "Pune", "Chennai", "Torino", "Milan",
-    "Florence", "Munich", "Berlin", "Paris", "Aberdeen", "Glasgow",
-    "Cork", "Dublin", "Madrid", "Barcelona", "Getafe", "Budapest",
-    "Amsterdam", "Warsaw", "Krakow", "Tokyo", "Seoul", "Taipei", "Zurich",
-    "Baden", "Ebene", "Dubai", "Tel Aviv",
+    "Shanghai", "Beijing", "Shenzhen", "Suzhou", "Bengaluru", "Bangalore",
+    "Hyderabad", "Pune", "Chennai", "Torino", "Madrid", "Barcelona",
+    "Getafe", "Budapest", "Amsterdam", "Krakow", "Tokyo", "Seoul",
+    "Taipei", "Zurich", "Ebene", "Dubai", "Tel Aviv",
 ]
 _FOREIGN_NAMES = sorted(FOREIGN_COUNTRIES + FOREIGN_CITIES, key=len, reverse=True)
 _FOREIGN_ALTS = "|".join(re.escape(n) for n in _FOREIGN_NAMES)
@@ -447,10 +455,11 @@ _WORKDAY_PLACE_RE = re.compile(r"/job/([^/]+)/[^/]+")
 
 def _us_or_canada(loc: str, province_codes: bool = True) -> str | None:
     codes_us, codes_ca = set(), set()
-    # "Arlington, VA +2", "Boston, MASanta Clara": a code right after a
+    # "Arlington, VA +2", "Plano, TXLondon, UK": a code right after a
     # comma, ending the word or glued to the next capitalized one -- but
     # not the start of an all-caps word ("IT, FI, FLORENCE" is not FL).
-    for m in re.finditer(r",\s*([A-Z]{2})(?![A-Za-z]|[A-Z][A-Z])", loc):
+    # "MANYC" is left to the caps-run rule below.
+    for m in re.finditer(r",\s*([A-Z]{2})(?![a-z]|[A-Z]{2})", loc):
         if m.group(1) in CA_PROVINCES:
             if province_codes:
                 codes_ca.add(m.group(1))
@@ -478,17 +487,31 @@ def _us_or_canada(loc: str, province_codes: bool = True) -> str | None:
 
 
 def _region_from_link(link: str | None) -> str | None:
-    """Region from a Workday link's location segment, or None."""
+    """USA or Canada from a Workday link's location segment, else None.
+
+    Never "International": link text is weak evidence, and plenty of US
+    segments carry foreign-sounding names ("OH-Dublin-Cardinal-Place",
+    "US---MD-Aberdeen", "USA---New-York---Malta"). A link can only prove
+    a posting is local, never hide it.
+    """
     m = _WORKDAY_PLACE_RE.search(urlparse(link or "").path)
     if not m:
         return None
     seg = m.group(1)
-    # Foreign names first: "IN_Bangalore" would otherwise read as Indiana.
+    tokens = [t for t in re.split(r"-+", seg) if t]
+    text = ", " + ", ".join(tokens)
+    # Full names, or a literal US/USA token, win outright:
+    # "New-Berlin-Wisconsin-United-States", "US---MD-Aberdeen".
+    spaced = " ".join(tokens)
+    if _CA_NAMES_RE.search(spaced):
+        return "Canada"
+    if _US_NAMES_RE.search(spaced) or {"US", "USA"} & set(tokens):
+        return "USA"
+    # Codes only when nothing foreign is named, since "IN_Bangalore" would
+    # read as Indiana. Province codes are off: "...-Nootdorp-NL" is Dutch.
     if _FOREIGN_LINK_RE.search(seg.replace("_", "-")):
-        return "International"
-    # "Kingwood-TX" -> "Kingwood, TX" so the comma-code rule applies.
-    # Province codes are off here: "...-Nootdorp-NL" is the Netherlands.
-    return _us_or_canada(", " + ", ".join(seg.split("-")), province_codes=False)
+        return None
+    return _us_or_canada(text, province_codes=False)
 
 
 def region_of(label: str, location: str, link: str | None = None) -> str | None:
@@ -505,7 +528,11 @@ def region_of(label: str, location: str, link: str | None = None) -> str | None:
     if region:
         return region
 
-    if _FOREIGN_RE.search(loc):
+    # speedyapply shows only the FIRST location and hides the rest behind
+    # "+N" -- "Yinchuan, China +1" was Relay's Raleigh, NC internship. So
+    # a foreign first place proves nothing; only the link or file can say.
+    more_hidden = re.search(r"\+\s*\d+\s*$", loc)
+    if _FOREIGN_RE.search(loc) and not more_hidden:
         return "International"
 
     # Nothing recognisable in the cell -- blank, "Remote", or a place not
@@ -515,7 +542,7 @@ def region_of(label: str, location: str, link: str | None = None) -> str | None:
     region = _region_from_link(link)
     if region:
         return region
-    if "USA" in (label or "").upper():
+    if "USA" in (label or "").upper() or (more_hidden and "INTL" not in (label or "").upper()):
         return "USA"
     return None
 
@@ -546,10 +573,15 @@ def classify(repo: str, label: str, row: dict) -> list[str]:
 
     tags = []
 
-    for tag, pattern in _TIER_RES:
-        if pattern.search(company):
-            tags.append(tag)
-            break          # one tier per company
+    # Anchored to the start of the name ("GE Vernova", "Mistral AI"), so a
+    # tier word inside someone else's name doesn't count: "H&R Block" is
+    # not Block, "Robert Bosch Venture Capital" is not Bosch.
+    lead = re.sub(r"^[^A-Za-z0-9]+", "", company)   # "🔥ByteDance"
+    if lead.lower() not in NOT_TIERED:
+        for tag, pattern in _TIER_RES:
+            if pattern.match(lead):
+                tags.append(tag)
+                break      # one tier per company
 
     domains = [tag for tag, pattern in _DOMAIN_RES if pattern.search(role)]
     # The AI repo is an AI list by construction, so trust it when the role
@@ -561,6 +593,10 @@ def classify(repo: str, label: str, row: dict) -> list[str]:
 
     if _PHD_RE.search(role):
         tags.append("\U0001F393 PhD")
+
+    age = row_age_days(row)
+    if age is not None and age > FRESH_DAYS:
+        tags.append(f"\U0001F570\ufe0f Posted {age}d ago")
 
     if "NEW_GRAD" in (label or "").upper():
         # Kept only because it read as a co-op; flagged because it was
@@ -578,6 +614,14 @@ REPOS = sorted({repo for repo, _, _ in SOURCES})
 STATE_DIR = Path("state")
 LOG_FILE = STATE_DIR / "new_jobs_log.jsonl"
 LEDGER_FILE = STATE_DIR / "notified.json"
+# Postings a run found but couldn't deliver, keyed like the ledger. They
+# are retried whatever their age -- without this, a two-day Discord
+# outage would age them past MAX_AGE_DAYS and drop them for good.
+UNDELIVERED_FILE = STATE_DIR / "undelivered.json"
+# Consecutive failed fetches per source. A renamed or archived repo would
+# otherwise fail quietly on every run while the job stays green.
+FETCH_FAILURES_FILE = STATE_DIR / "fetch_failures.json"
+FETCH_ALERT_AFTER = int(os.environ.get("FETCH_ALERT_AFTER", "6"))   # ~3h at 30 min
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # auto-provided inside GitHub Actions
 
@@ -588,14 +632,20 @@ FLOOD_THRESHOLD = int(os.environ.get("FLOOD_THRESHOLD", "50"))
 
 AGE_CELL_RE = re.compile(r"^\d+\s*(d|day|days|h|hr|hrs|hour|hours|mo|month|months|w|wk|week|weeks)$", re.I)
 
-# Only postings this fresh are worth an alert. Being new to a LIST is not
-# the same as being newly posted: these repos backfill heavily. On
-# 2026-07-31 speedyapply added 68 rows in one pass, of which 13 had gone
-# up within a day, 40 within four days, and 15 were over a week old --
-# one of them 105 days. Age comes straight from each list's own last
-# column, so the cutoff is on when the employer posted, not on when the
+# Being new to a LIST is not the same as being newly posted: these repos
+# backfill heavily. On 2026-07-31 speedyapply added 68 rows in one pass,
+# of which 13 had gone up within a day, 40 within four days, and 15 were
+# over a week old -- one of them 105 days. Age comes straight from each
+# list's own last column, so it's when the employer posted, not when the
 # scraper noticed.
-MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "2"))
+#
+# A backfilled posting is still one you haven't seen, so it is sent, just
+# tagged with its age once it's older than FRESH_DAYS. Only rows past
+# MAX_AGE_DAYS are skipped -- at a month old they are mostly filled or
+# closed. Skipped rows are never recorded, and the snapshot moves past
+# them, so raising MAX_AGE_DAYS later does not bring them back.
+FRESH_DAYS = int(os.environ.get("FRESH_DAYS", "2"))
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "30"))
 
 # "3d", "10h", "2mo" (Simplify, speedyapply) ...
 _AGE_RELATIVE = re.compile(r"^(\d+)\s*([a-z]+)$", re.I)
@@ -641,11 +691,13 @@ def row_age_days(row: dict, today: date | None = None) -> int | None:
         # year -- "Dec 15" read in January is three weeks ago, not eleven
         # months out. One day of slack absorbs timezone skew between the
         # list's clock and ours.
-        for year in (today.year, today.year - 1):
+        # Next year first, for the same skew across New Year: "Jan 1" read
+        # late on Dec 31 is tomorrow, not 364 days ago.
+        for year in (today.year + 1, today.year, today.year - 1):
             try:
                 posted = date(year, month, int(m.group(2)))
             except ValueError:
-                return None                  # e.g. Feb 30
+                continue                     # Feb 29 outside a leap year
             if (posted - today).days <= 1:
                 return max(0, (today - posted).days)   # tomorrow == today
     return None
@@ -755,40 +807,103 @@ TRACKING_PARAMS = {
 
 # Two lists routinely carry the SAME posting under different URL shapes.
 # Left alone each shape is its own identity, so the job is announced once
-# per shape. Observed between speedyapply and SimplifyJobs:
+# per shape. Observed between speedyapply and SimplifyJobs (the log had
+# 243 postings delivered under more than one key before these rules):
 #
-#   Workday  /en-US/<site>/job/...       vs  /<site>/job/...
-#   iCIMS    /jobs/<id>/<title-slug>/job vs  /jobs/<id>/job?mobile=true&...
-#   Apple    /details/<id>/<title-slug>  vs  /details/<id>-<team>
+#   Workday   /en-US/<site>/job/<place>/<slug>_R123-1  vs
+#             /<other-site>/job/<other-place>/<slug>_R123, and the same
+#             posting again on wd1.myworkdaysite.com/recruiting/<tenant>/
+#   iCIMS     /jobs/<id>/<title-slug>/job  vs  /jobs/<id>/job?mobile=true
+#   Apple     /details/<id>/<title-slug>  vs  /details/<id>-<team>
+#   Greenhouse /<co>/jobs/<id>, ?gh_jid=<id>, embed/job_app?token=<id>,
+#             and company pages carrying ?gh_jid=<id>
+#   Ashby     /<co>/<uuid>  vs  /<co>/<uuid>/application?embed=true
+#   Lever     /<co>/<uuid>  vs  /<co>/<uuid>/apply
+#   SmartRecruiters /<co>/<id>  vs  /<co>/<id>-<title-slug>?oga=true
+#   ByteDance jobs.bytedance.com/en/position/<id>/detail  vs
+#             joinbytedance.com/search/<id>
+#   Microsoft /careers/job/<id>  vs  /careers?pid=<id>&query=...
 #
-# Each rule discards only a display detail -- the locale a page renders
-# in, or a slug/suffix derived from the title -- and never the
+# Each rule discards only a display detail -- the locale, site name,
+# location or title slug a page renders with -- and never the
 # requisition id. Deliberately per-host rather than a general "same host
-# plus same number is the same job": on greenhouse and lever the trailing
-# path segment IS the posting, so a generic rule would merge distinct
-# jobs and silently stop announcing them.
+# plus same number is the same job": on most boards the trailing path
+# segment IS the posting, so a generic rule would merge distinct jobs
+# and silently stop announcing them.
 _LOCALE_SEG = re.compile(r"^/[a-z]{2}-[a-z]{2}(?=/)")
 _ICIMS_JOB = re.compile(r"^/jobs/(\d+)(?:/|$)")
 _APPLE_JOB = re.compile(r"^(?:/[a-z]{2}-[a-z]{2})?/details/(\d+)")
+# The requisition id ends a Workday slug: "..._R244387-1", "..._JR100404",
+# "..._202607-119043-1". A trailing "-1"/"-2" numbers re-posts of one
+# requisition (one per site or location), so it goes; the "-119043" in
+# Roche's ids is part of the id and is long enough to stay.
+_WORKDAY_REQ = re.compile(r"[a-z]*-?\d[a-z\d-]*")
 
 
-def _canonical_job_path(host: str, path: str) -> tuple[str, bool]:
-    """Collapse a provider's interchangeable URL forms onto one path.
+def _workday_req(slug: str) -> str | None:
+    head, sep, req = slug.rpartition("_")
+    if not sep or not _WORKDAY_REQ.fullmatch(req):
+        return None
+    base = re.sub(r"-\d{1,2}$", "", req)
+    return base if re.search(r"\d{3,}", base) else req
+_WORKDAY_SITE = re.compile(r"^/recruiting/([^/]+)/")
+_GREENHOUSE_PATH = re.compile(r"^/[^/]+/jobs/(\d+)$")
+_UUID_JOB = re.compile(r"^(/[^/]+/[0-9a-f-]{36})(?:/(?:application|apply))?$")
+_SMARTRECRUITERS_JOB = re.compile(r"^(/[^/]+/\d+)(?:-[^/]*)?$")
+_BYTEDANCE_JOB = re.compile(r"^(?:/[a-z]{2})?/(?:position|search)/(\d+)(?:/detail)?$")
+_MICROSOFT_JOB = re.compile(r"^/careers/job/(\d+)$")
 
-    Takes an already-lowercased host and path. Returns (path,
-    keep_query); the query is dropped only where the requisition id in
-    the path is the entire identity, so no rule here can merge two
-    postings that a query param would have told apart.
+
+def _canonical_job_path(host: str, path: str, query: dict) -> tuple[str, str, dict]:
+    """Collapse a provider's interchangeable URL forms onto one identity.
+
+    Takes an already-lowercased host and path plus the parsed query, and
+    returns (host, path, query). The query is dropped only where the id
+    left in the path is the entire identity, so no rule here can merge
+    two postings that a query param would have told apart.
     """
-    if host.endswith(".myworkdayjobs.com"):
-        return _LOCALE_SEG.sub("", path), True
+    one = {k: (v[0] if isinstance(v, list) else v) for k, v in query.items()}
+
+    # Greenhouse ids are global, so every Greenhouse form -- including a
+    # company's own careers page -- folds onto one key.
+    gh = one.get("gh_jid")
+    if not gh and host.endswith("greenhouse.io"):
+        m = _GREENHOUSE_PATH.match(path)
+        gh = m.group(1) if m else (one.get("token") if path == "/embed/job_app" else None)
+    if gh and gh.isdigit():
+        return "greenhouse.io", f"/jobs/{gh}", {}
+
+    if host.endswith(".myworkdayjobs.com") or host.endswith(".myworkdaysite.com"):
+        path = _LOCALE_SEG.sub("", path)
+        tenant = host.split(".", 1)[0]
+        site = _WORKDAY_SITE.match(path)
+        if site:                        # wd1.myworkdaysite.com/recruiting/<tenant>/...
+            tenant = site.group(1)
+        req = _workday_req(path.rsplit("/", 1)[-1])
+        if req and tenant and not tenant.startswith("wd"):
+            return f"{tenant}.myworkdayjobs.com", f"/req/{req}", {}
+        return host, path, query
     if host.endswith(".icims.com"):
         m = _ICIMS_JOB.match(path)
-        return (f"/jobs/{m.group(1)}", False) if m else (path, True)
+        return (host, f"/jobs/{m.group(1)}", {}) if m else (host, path, query)
     if host == "jobs.apple.com":
         m = _APPLE_JOB.match(path)
-        return (f"/details/{m.group(1)}", False) if m else (path, True)
-    return path, True
+        return (host, f"/details/{m.group(1)}", {}) if m else (host, path, query)
+    if host == "jobs.ashbyhq.com" or host.endswith("lever.co"):
+        m = _UUID_JOB.match(path)
+        return (host, m.group(1), {}) if m else (host, path, query)
+    if host == "jobs.smartrecruiters.com":
+        m = _SMARTRECRUITERS_JOB.match(path)
+        return (host, m.group(1), {}) if m else (host, path, query)
+    if host in ("jobs.bytedance.com", "joinbytedance.com"):
+        m = _BYTEDANCE_JOB.match(path)
+        return ("bytedance.com", f"/position/{m.group(1)}", {}) if m else (host, path, query)
+    if host == "apply.careers.microsoft.com":
+        m = _MICROSOFT_JOB.match(path)
+        pid = m.group(1) if m else (one.get("pid") if path == "/careers" else None)
+        if pid:
+            return host, f"/careers/job/{pid}", {}
+    return host, path, query
 
 
 def normalize_url(url: str) -> str:
@@ -802,17 +917,14 @@ def normalize_url(url: str) -> str:
     """
     parsed = urlparse(url.strip())
     kept = {
-        k: v for k, v in parse_qs(parsed.query, keep_blank_values=False).items()
+        k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=False).items()
         if k.lower() not in TRACKING_PARAMS
     }
     host = parsed.netloc.lower()
     if host.startswith("www."):
         host = host[4:]
-    path, keep_query = _canonical_job_path(host, parsed.path.rstrip("/").lower())
-    query = (
-        urlencode(sorted((k, v[0]) for k, v in kept.items()))
-        if kept and keep_query else ""
-    )
+    host, path, kept = _canonical_job_path(host, parsed.path.rstrip("/").lower(), kept)
+    query = urlencode(sorted(kept.items())) if kept else ""
     return f"{host}{path}" + (f"?{query}" if query else "")
 
 
@@ -880,11 +992,17 @@ def extract_rows_markdown(text: str) -> list[dict]:
         lowered = [c.lower() for c in cells]
         if sum(1 for c in lowered if c in HEADER_WORDS) >= 2:
             continue  # header row
-        links_in_row = []
-        for c in raw_cells:
-            links_in_row.extend(re.findall(r'href=[\'"](https?://[^\'" ]+)[\'"]', c))
-            links_in_row.extend(re.findall(r"\((https?://[^\s)]+)\)", c))
-        link = _best_link(links_in_row)
+        def links_in(cells_: list[str]) -> list[str]:
+            found = []
+            for c in cells_:
+                found.extend(re.findall(r'href=[\'"](https?://[^\'" ]+)[\'"]', c))
+                found.extend(re.findall(r"\((https?://[^\s)]+)\)", c))
+            return found
+        # The company cell links to the company's homepage. Left in the
+        # pool it can out-score the apply link (ALTEN Mexico's rows keyed on
+        # a sites.google.com page), and a homepage with 4+ digits in it
+        # would give every role at that company ONE key.
+        link = _best_link(links_in(raw_cells[1:]) or links_in(raw_cells[:1]))
         rows.append({"cells": cells, "link": link, "key": _row_identity(cells, link)})
     return rows
 
@@ -937,7 +1055,11 @@ def _fill_continuation_companies(rows: list[dict]) -> list[dict]:
 def extract_rows(text: str) -> list[dict]:
     soup = BeautifulSoup(text, "html.parser")
     html_rows = extract_rows_html(soup)
-    rows = html_rows if html_rows else extract_rows_markdown(text)
+    # Whichever format carries the listing. Not "HTML if any": one stray
+    # <tr> (a legend or contributors table) in a markdown README would
+    # otherwise silently empty that whole source.
+    md_rows = extract_rows_markdown(text) if "|" in text else []
+    rows = html_rows if len(html_rows) >= len(md_rows) else md_rows
     rows = _disambiguate_keys(rows)
 
     # The signature as the row was PARSED, with "↳" still in the company
@@ -1002,16 +1124,48 @@ def load_ledger() -> dict:
     return data
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file and rename, so a run killed mid-write leaves
+    the old file intact instead of a truncated one. A half-written ledger
+    is exactly what forces the re-seed path in main()."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def save_ledger(ledger: dict):
     if DRY_RUN:
         return
-    LEDGER_FILE.write_text(json.dumps(ledger, indent=0, sort_keys=True), encoding="utf-8")
+    _atomic_write(LEDGER_FILE, json.dumps(ledger, indent=0, sort_keys=True))
 
 
 def write_snapshot(state_file: Path, text: str):
     if DRY_RUN:
         return
-    state_file.write_text(text, encoding="utf-8")
+    _atomic_write(state_file, text)
+
+
+def _load_json_dict(path: Path) -> dict:
+    """A small state file, or {} if it's missing or unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_json_dict(path: Path, data: dict) -> None:
+    if DRY_RUN:
+        return
+    if data:
+        _atomic_write(path, json.dumps(data, indent=0, sort_keys=True))
+    else:
+        path.unlink(missing_ok=True)
 
 
 # A URL containing a long numeric run is a specific job requisition
@@ -1024,6 +1178,14 @@ def write_snapshot(state_file: Path, text: str):
 # new role behind it never surfaces. Since a missed posting costs more
 # than a duplicate, those fold company+role into the key.
 JOB_ID_RE = re.compile(r"\d{4,}")
+# Keys _canonical_job_path has already reduced to a requisition id. Short
+# Workday ids ("..._REQ636") fall under JOB_ID_RE's four digits.
+_CANONICAL_REQ_RE = re.compile(r"^[^/]+\.myworkdayjobs\.com/req/")
+
+
+def _is_requisition(key: str) -> bool:
+    """True when a normalized URL names one posting on its own."""
+    return bool(JOB_ID_RE.search(key) or _CANONICAL_REQ_RE.match(key))
 
 # Dropped from the role signature: wording that varies between repos
 # without changing which job is meant.
@@ -1074,7 +1236,7 @@ def ledger_key(repo: str, row: dict) -> str:
         return f"{repo}::{row['key']}"
 
     url = normalize_url(link)
-    if JOB_ID_RE.search(url):
+    if _is_requisition(url):
         return url                                  # unambiguous requisition
     # Prefer the signature pinned at parse time; fall back for rows built
     # by hand (tests) that never went through extract_rows.
@@ -1099,7 +1261,7 @@ def legacy_ledger_key(repo: str, row: dict) -> str | None:
     if not link:
         return None                     # text keys never included the signature
     url = normalize_url(link)
-    if JOB_ID_RE.search(url):
+    if _is_requisition(url):
         return None                     # requisition keys never included it either
     legacy = row.get("sig_legacy")
     if not legacy or legacy == row.get("sig"):
@@ -1117,11 +1279,17 @@ def _recanonicalize_key(key: str) -> str:
     head, hash_sep, sig = key.partition("#")
     base, _, query = head.partition("?")
     host, slash, rest = base.partition("/")
-    path, keep_query = _canonical_job_path(host, f"/{rest}" if slash and rest else "")
+    parsed_query = {k: v[0] for k, v in parse_qs(query).items()}
+    host, path, parsed_query = _canonical_job_path(
+        host, f"/{rest}" if slash and rest else "", parsed_query)
     out = host + path
-    if query and keep_query:
-        out += f"?{query}"
-    return out + (hash_sep + sig if hash_sep else "")
+    if parsed_query:
+        out += "?" + urlencode(sorted(parsed_query.items()))
+    # A key that now carries a requisition id no longer needs the role
+    # signature that told evergreen pages apart (see ledger_key).
+    if hash_sep and not _is_requisition(out):
+        out += hash_sep + sig
+    return out
 
 
 def migrate_ledger(ledger: dict) -> tuple[dict, int]:
@@ -1168,8 +1336,6 @@ def migrate_ledger(ledger: dict) -> tuple[dict, int]:
 # volume is held down by MAX_AGE_DAYS instead, and send_jobs_to_discord
 # paces itself between messages.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
-
-EMBEDS_PER_MESSAGE = 1
 
 # Triage reactions, pre-placed on each card so marking a posting is one
 # click instead of a trip through the emoji picker.
@@ -1237,13 +1403,27 @@ def _webhook_url(want_message: bool) -> str:
     return parts._replace(query=urlencode(query, doseq=True)).geturl()
 
 
-def _post_discord(payload: dict, want_message: bool = False) -> dict | None:
+# Status of the last failed _post_discord call, so a caller can tell a
+# rejected payload (400) from Discord being down.
+_last_post_status: int | None = None
+
+
+def _post_discord(payload: dict, want_message: bool = False,
+                  nonce: str | None = None) -> dict | None:
     """Send one message, as the bot when configured, else via webhook.
 
     Returns the created message on success (an empty dict when Discord
     sent no body), or None on failure. Callers must test `is not None`
     -- a successful post with no body is an empty, falsy dict.
+
+    A timeout or 5xx does not mean the message wasn't created, so a retry
+    can post it twice. As the bot, `nonce` with enforce_nonce makes
+    Discord return the existing message instead of creating a second one.
+    Webhooks have no equivalent, so there a retry may duplicate a card --
+    deliberately: a duplicate costs less than a posting never sent.
     """
+    global _last_post_status
+    _last_post_status = None
     if DRY_RUN:
         print(f"[DRY RUN discord] {json.dumps(payload)[:1500]}")
         return {}
@@ -1251,6 +1431,8 @@ def _post_discord(payload: dict, want_message: bool = False) -> dict | None:
     if POST_AS_BOT:
         url = f"{DISCORD_API}/channels/{DISCORD_CHANNEL_ID}/messages"
         headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+        if nonce:
+            payload = {**payload, "nonce": nonce, "enforce_nonce": True}
     else:
         # Components are rejected on a UI-created webhook, so drop the
         # button rather than lose the whole card to a 400.
@@ -1283,6 +1465,7 @@ def _post_discord(payload: dict, want_message: bool = False) -> dict | None:
             continue
 
         print(f"Discord returned {resp.status_code}: {resp.text[:300]}")
+        _last_post_status = resp.status_code
         if 400 <= resp.status_code < 500:
             return None   # malformed payload; retrying won't help
         time.sleep(2 * attempt)
@@ -1335,15 +1518,30 @@ def _add_triage_reactions(message: dict) -> None:
         time.sleep(0.3)
 
 
+# Discord caps link-button URLs at 512 characters, and a bad embed url or
+# button url fails the WHOLE message with a 400 -- which would then fail
+# on every run until the posting aged out.
+MAX_BUTTON_URL = 512
+
+
+def safe_link(row: dict) -> str | None:
+    """The row's link if Discord will accept it as a url, else None."""
+    link = (row.get("link") or "").strip()
+    if (not link.startswith(("http://", "https://")) or re.search(r"\s", link)
+            or len(link) > MAX_BUTTON_URL or not urlparse(link).netloc):
+        return None
+    return link
+
+
 def build_apply_button(row: dict) -> list | None:
     """An action row holding one link button, or None if there's no link.
 
-    Discord rejects a link button whose url isn't http(s), and some rows
-    carry no application link at all -- both cases just get a card with
-    no button rather than a failed send.
+    Some rows carry no application link at all, or one Discord would
+    reject -- both just get a card with no button rather than a failed
+    send.
     """
-    link = (row.get("link") or "").strip()
-    if not link.startswith(("http://", "https://")):
+    link = safe_link(row)
+    if not link:
         return None
     return [{
         "type": 1,                       # action row
@@ -1375,8 +1573,9 @@ def build_job_embed(repo: str, row: dict, label: str | None = None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [],
     }
-    if row.get("link"):
-        embed["url"] = row["link"]
+    link = safe_link(row)
+    if link:
+        embed["url"] = link
 
     # Cell layout differs per repo, so label by position only where it's
     # unambiguous: index 2 is location in all four, and speedyapply adds
@@ -1385,8 +1584,8 @@ def build_job_embed(repo: str, row: dict, label: str | None = None,
         embed["fields"].append({"name": "Location", "value": _clip(cells[2], MAX_FIELD_VALUE), "inline": True})
     if len(cells) > 3 and cells[3] and ("$" in cells[3] or "/hr" in cells[3].lower()):
         embed["fields"].append({"name": "Pay", "value": _clip(cells[3], MAX_FIELD_VALUE), "inline": True})
-    if apply_field and row.get("link"):
-        embed["fields"].append({"name": "Apply", "value": _clip(f"[Open posting]({row['link']})", MAX_FIELD_VALUE), "inline": True})
+    if apply_field and link:
+        embed["fields"].append({"name": "Apply", "value": _clip(f"[Open posting]({link})", MAX_FIELD_VALUE), "inline": True})
 
     # Tags last and full-width, so they read as one line under the
     # details rather than competing with them for a column.
@@ -1421,39 +1620,59 @@ def push_line(item: dict) -> str:
     return _clip(f"{company} — {role}", MAX_PUSH_LINE)
 
 
-def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
+def _nonce(item: dict) -> str:
+    """Stable per posting, <= 25 chars as Discord requires."""
+    key = ledger_key(item["repo"], item["row"])
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:25]
+
+
+def send_jobs_to_discord(pending: list[dict], on_delivered=None) -> list[dict]:
     """Post every new job as its own Discord card, one per message.
 
     Returns the items that actually reached Discord. Anything missing from
     that list must NOT be written to the ledger -- leaving it out is what
     makes the next run retry it instead of dropping it silently.
+
+    on_delivered(item) runs straight after each successful card, so the
+    caller can record it at once: a run that dies halfway must not forget
+    the cards it already sent, or the next run posts them all again.
     """
     delivered = []
 
-    for i in range(0, len(pending), EMBEDS_PER_MESSAGE):
-        batch = pending[i : i + EMBEDS_PER_MESSAGE]
-        payload = {"embeds": [
-            build_job_embed(item["repo"], item["row"], item.get("label")) for item in batch
-        ]}
+    for i, item in enumerate(pending):
+        payload = {
+            "embeds": [build_job_embed(item["repo"], item["row"], item.get("label"))],
+            # Phone notifications show content, not the embed.
+            "content": push_line(item),
+        }
         # One posting per message is what makes a single Apply button
         # unambiguous; _post_discord strips components on the webhook
         # transport, which cannot carry them.
-        if len(batch) == 1:
-            components = build_apply_button(batch[0]["row"])
-            if components:
-                payload["components"] = components
-        if len(batch) == 1:
-            payload["content"] = push_line(batch[0])
+        components = build_apply_button(item["row"])
+        if components:
+            payload["components"] = components
 
         # want_message: the reactions need the id of the card just posted.
-        message = _post_discord(payload, want_message=bool(DISCORD_BOT_TOKEN))
+        want = bool(DISCORD_BOT_TOKEN)
+        message = _post_discord(payload, want_message=want, nonce=_nonce(item))
+        if message is None and _last_post_status == 400:
+            # Something in the card was rejected. The link is the usual
+            # suspect; send the posting bare rather than never.
+            print("Card rejected; retrying once without the link and button.")
+            bare = {k: v for k, v in payload.items() if k != "components"}
+            bare["embeds"] = [{k: v for k, v in e.items() if k != "url"} for e in bare["embeds"]]
+            for e in bare["embeds"]:
+                e["fields"] = [f for f in e.get("fields", []) if f.get("name") != "Apply"]
+            message = _post_discord(bare, want_message=want, nonce=_nonce(item)[:24] + "b")
         if message is not None:
-            delivered.extend(batch)
+            delivered.append(item)
+            if on_delivered:
+                on_delivered(item)
             _add_triage_reactions(message)
         else:
-            print(f"Batch of {len(batch)} posting(s) failed to send; they will be retried next run.")
-        # Stay comfortably under the webhook rate limit between batches.
-        if i + EMBEDS_PER_MESSAGE < len(pending):
+            print("Posting failed to send; it will be retried next run.")
+        # Stay comfortably under the webhook rate limit between messages.
+        if i + 1 < len(pending):
             time.sleep(1.2)
 
     return delivered
@@ -1462,6 +1681,23 @@ def send_jobs_to_discord(pending: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # 5. Main
 # ---------------------------------------------------------------------------
+def _log_delivery(item: dict, now: str) -> None:
+    if DRY_RUN:
+        return
+    row = item["row"]
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "repo": item["repo"],
+            "source": item.get("label"),
+            "cells": row["cells"],
+            "link": row["link"],
+            # Logged as well as displayed, so the digest can group or
+            # filter by tag without re-deriving anything.
+            "tags": classify(item["repo"], item.get("label") or "", row),
+            "seen_at": now,
+        }) + "\n")
+
+
 def main():
     STATE_DIR.mkdir(exist_ok=True)
     if DRY_RUN:
@@ -1473,24 +1709,29 @@ def main():
     # right now and send nothing -- otherwise the first run would push
     # every posting that already exists.
     seeding = not LEDGER_FILE.exists()
+    # An unreadable ledger is rebuilt from the LAST snapshots rather than
+    # from what's live now. Seeding from live would mark every posting
+    # that appeared since the last good run as sent without sending it;
+    # seeding from the snapshots lets the normal diff below announce them.
+    reseed_from_snapshots = False
     try:
         ledger = load_ledger()
     except LedgerError as e:
-        # An unreadable ledger can't be trusted to answer "already sent?",
-        # and carrying on with an empty one would re-announce every live
-        # posting. Keep the bad copy for inspection and re-seed instead:
-        # one silent run, then normal operation resumes.
         backup = LEDGER_FILE.with_name("notified.corrupt.json")
         if not DRY_RUN:
             LEDGER_FILE.replace(backup)
-        print(f"::error::Ledger unreadable ({e}). Moved it to {backup} and re-seeding "
-              "from what is live now; no alerts this run.")
-        ledger, seeding = {}, True
+        print(f"::error::Ledger unreadable ({e}). Moved it to {backup} and rebuilding it "
+              "from the last saved snapshots; postings new since then are still sent.")
+        ledger, reseed_from_snapshots = {}, True
     ledger, migrated = migrate_ledger(ledger)
     if migrated:
         print(f"Migrated {migrated} ledger entries to the current key format "
               f"({len(ledger)} distinct postings after merging duplicate URL forms).")
     now = datetime.now(timezone.utc).isoformat()
+
+    undelivered = {k: v for k, v in _load_json_dict(UNDELIVERED_FILE).items() if k not in ledger}
+    fetch_failures = _load_json_dict(FETCH_FAILURES_FILE)
+    fetched = 0
 
     pending = []          # rows that are new AND not already in the ledger
     seen_this_run = set() # guards against the same URL arriving from two repos
@@ -1507,36 +1748,50 @@ def main():
         try:
             new_text = fetch_file(repo, path)
         except Exception as e:
-            print(f"Failed to fetch {label}: {e}")
+            fetch_failures[label] = int(fetch_failures.get(label, 0)) + 1
+            print(f"Failed to fetch {label} ({fetch_failures[label]} run(s) in a row): {e}")
             continue
+        fetched += 1
+        fetch_failures.pop(label, None)
 
         rows = [r for r in extract_rows(new_text) if keep_row(r, mode, label)]
 
-        if seeding:
+        if seeding or (reseed_from_snapshots and not state_file.exists()):
             for row in rows:
                 ledger[ledger_key(repo, row)] = now
             write_snapshot(state_file, new_text)
             print(f"Seeded {len(rows):4} postings from {label}")
             continue
 
+        old_text = state_file.read_text(encoding="utf-8") if state_file.exists() else None
+        if reseed_from_snapshots:
+            for row in extract_rows(old_text):
+                if keep_row(row, mode, label):
+                    ledger.setdefault(ledger_key(repo, row), now)
+
         # The snapshot narrows down what changed; the ledger has the final
         # say on whether it's ever been sent.
-        if state_file.exists():
-            candidates = find_new_rows(repo, state_file.read_text(encoding="utf-8"), new_text, mode, label)
+        if old_text is not None:
+            candidates = find_new_rows(repo, old_text, new_text, mode, label)
+            # Anything a previous run failed to deliver is a candidate again,
+            # even if its snapshot has since moved on.
+            known = {ledger_key(repo, r) for r in candidates}
+            candidates += [r for r in rows if ledger_key(repo, r) in undelivered
+                           and ledger_key(repo, r) not in known]
         else:
             # Snapshot lost (e.g. a state commit failed). Fall back to
             # checking every current row against the ledger.
             print(f"No snapshot for {label}; falling back to full ledger comparison.")
             candidates = rows
 
-        # Drop anything the list itself says is older than the cutoff.
-        # These are never recorded in the ledger and the snapshot advances
-        # past them, so they will not resurface if MAX_AGE_DAYS is raised
-        # later -- the point is that an old posting isn't news, not that
-        # it's already been handled.
-        stale = sum(1 for r in candidates if not is_fresh(r))
+        # Drop anything the list itself says is past MAX_AGE_DAYS -- except
+        # a posting already owed from an earlier failed delivery, which is
+        # sent however old it has become.
+        def too_old(r):
+            return not is_fresh(r) and ledger_key(repo, r) not in undelivered
+        stale = sum(1 for r in candidates if too_old(r))
         if stale:
-            candidates = [r for r in candidates if is_fresh(r)]
+            candidates = [r for r in candidates if not too_old(r)]
             print(f"{label}: skipped {stale} row(s) posted over {MAX_AGE_DAYS} days ago.")
 
         unsent = []
@@ -1563,16 +1818,25 @@ def main():
 
         snapshots[state_file] = new_text
 
+    _save_json_dict(FETCH_FAILURES_FILE, fetch_failures)
+    problems = []
+    if fetched == 0:
+        problems.append("every source failed to fetch")
+    stuck = sorted(l for l, n in fetch_failures.items() if int(n) >= FETCH_ALERT_AFTER)
+    if stuck:
+        problems.append(f"no successful fetch in {FETCH_ALERT_AFTER}+ runs for: {', '.join(stuck)} "
+                        "(renamed, archived or moved? check SOURCES)")
+
     if seeding:
         save_ledger(ledger)
         print(f"Ledger seeded with {len(ledger)} postings. Future runs will notify only on genuinely new ones.")
-        return
+        return _finish(problems)
 
     # An unusual count still gets one heads-up first, because a spike can
     # mean a repo rewrote its links or a list was renamed or replaced
     # wholesale rather than a genuine hiring surge, and this run can't tell
-    # which. It no longer changes HOW the postings are sent -- they follow
-    # as individual cards either way, same as any other run.
+    # which. It doesn't change HOW the postings are sent -- they follow as
+    # individual cards either way, same as any other run.
     if len(pending) > FLOOD_THRESHOLD:
         by_repo = {}
         for item in pending:
@@ -1592,33 +1856,28 @@ def main():
         print(f"FLOOD GUARD: {len(pending)} rows exceeded threshold of {FLOOD_THRESHOLD}; "
               "sent a heads-up, then every posting as its own card.")
 
-    delivered = send_jobs_to_discord(pending)
+    # Recorded card by card, so a run that dies partway keeps what it sent.
+    def record(item):
+        k = ledger_key(item["repo"], item["row"])
+        ledger[k] = now
+        undelivered.pop(k, None)
+        save_ledger(ledger)
+        _log_delivery(item, now)
+
+    delivered = send_jobs_to_discord(pending, on_delivered=record)
 
     # Only what Discord actually accepted goes in the ledger. The rest is
-    # left untouched on purpose so the next run picks it up again -- these
-    # are the same objects that went into `pending`, hence the identity set.
+    # remembered in UNDELIVERED_FILE, and its source keeps the old
+    # snapshot, so the next run retries it -- these are the same objects
+    # that went into `pending`, hence the identity set.
     delivered_ids = {id(item) for item in delivered}
-    stale_sources = {item["state_file"] for item in pending if id(item) not in delivered_ids}
-
-    if delivered:
-        for item in delivered:
-            ledger[ledger_key(item["repo"], item["row"])] = now
-        if not DRY_RUN:
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                for item in delivered:
-                    row = item["row"]
-                    f.write(json.dumps({
-                        "repo": item["repo"],
-                        "source": item.get("label"),
-                        "cells": row["cells"],
-                        "link": row["link"],
-                        # Logged as well as displayed, so the digest can
-                        # group by tag without re-deriving anything.
-                        "tags": classify(item["repo"], item.get("label") or "", row),
-                        "seen_at": now,
-                    }) + "\n")
+    failed = [item for item in pending if id(item) not in delivered_ids]
+    for item in failed:
+        undelivered.setdefault(ledger_key(item["repo"], item["row"]), now)
+    stale_sources = {item["state_file"] for item in failed}
 
     save_ledger(ledger)
+    _save_json_dict(UNDELIVERED_FILE, undelivered)
 
     # A source holding undelivered postings keeps its old snapshot, so the
     # next run re-detects them. Sources that fully delivered move forward.
@@ -1627,14 +1886,26 @@ def main():
             continue
         write_snapshot(state_file, text)
 
-    undelivered = len(pending) - len(delivered)
-    if undelivered:
-        print(f"::warning::{undelivered} posting(s) could not be delivered to Discord. They were "
-              f"left out of the ledger and {len(stale_sources)} snapshot(s) held back so the next run retries them.")
+    if failed:
+        problems.append(f"{len(failed)} posting(s) could not be delivered to Discord; they will "
+                        f"be retried next run ({len(undelivered)} owed in total)")
     if relabelled:
         print(f"Carried {relabelled} ledger entr(ies) onto the resolved-continuation key format.")
     print(f"Done. {len(delivered)} posting(s) sent this run. Ledger holds {len(ledger)} known postings.")
+    return _finish(problems)
+
+
+def _finish(problems: list[str]) -> int:
+    """Exit status for the run. State is already saved by now.
+
+    Non-zero on purpose when something needs a human: a green run is the
+    only signal anyone watches, and a watcher that quietly stops sending
+    looks exactly like a quiet day.
+    """
+    for p in problems:
+        print(f"::error::{p}")
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
