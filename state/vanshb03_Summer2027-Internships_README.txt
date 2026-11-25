@@ -49,7 +49,8 @@ This repo is inspired by [Pitt CSC & Simplify Repo](https://github.com/SimplifyJ
 | Samsung Semiconductor | LLM Inference Acceleration Architecture Intern, MoE & Attention–FFN Disaggregation | San Jose, CA | <a href="https://go.vansh.nyc/1IH?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | SambaNova | Runtime Engineer Intern | Austin, TX | <a href="https://go.vansh.nyc/1IR?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Reach Labs | Hardware Prototyping Intern | Redwood City, CA | <a href="https://go.vansh.nyc/1IF?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
-| NVIDIA | Developer Technology Intern, AI | Santa Clara, CA | <a href="https://go.vansh.nyc/1Im?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
+| NVIDIA | Software Engineering Intern, Simulation Technology | Santa Clara, CA | <a href="https://go.vansh.nyc/1J0?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
+| ↳ | Developer Technology Intern, AI | Santa Clara, CA | <a href="https://go.vansh.nyc/1Im?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | National Interstate Insurance | Quality Assurance Intern 🛂 | Cincinnati, OH | <a href="https://go.vansh.nyc/1Iy?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Kimley-Horn | Data Science Intern | Mesa, AZ | <a href="https://go.vansh.nyc/1IN?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Johns Hopkins Applied Physics Laboratory | Cyber Physical Systems Intern | Laurel, MD | <a href="https://go.vansh.nyc/1IY?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
@@ -62,9 +63,6 @@ This repo is inspired by [Pitt CSC & Simplify Repo](https://github.com/SimplifyJ
 | Draper | HWIL & Real Time Simulation Intern 🇺🇸 | Cambridge, MA | <a href="https://go.vansh.nyc/1Ib?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | BEUMER Group | AI Development Intern | United States | <a href="https://go.vansh.nyc/1I9?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Bandwidth Inc. | Software Engineer Intern | Raleigh, NC | <a href="https://go.vansh.nyc/1IW?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
-| ↳ | Software Engineer Intern | Raleigh, NC | <a href="https://go.vansh.nyc/1IV?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
-| ↳ | Software Engineer Intern | Raleigh, NC | <a href="https://go.vansh.nyc/1IU?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
-| ↳ | Software Engineer Intern | Raleigh, NC | <a href="https://go.vansh.nyc/1IS?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Apex Technology, Inc. | Software Engineer Intern, Test Automation | Los Angeles, CA | <a href="https://go.vansh.nyc/1It?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Ameren | Robotics, AI, OT, Software Development Intern | St. Louis, MO | <a href="https://go.vansh.nyc/1Iz?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
 | Altera | AI Software Development Engineer Intern | Toronto, Canada | <a href="https://go.vansh.nyc/1Ih?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Nov 24 |
@@ -2074,6 +2072,9 @@ This repo is inspired by [Pitt CSC & Simplify Repo](https://github.com/SimplifyJ
 | Barkback | Software Intern | Santa Barbara, CA | <a href="https://go.vansh.nyc/Qv?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Mar 2016 |
 | Northwestern Mutual | Application Development Intern | Milwaukee, WI | <a href="https://go.vansh.nyc/Qu?s=y"><img src="https://i.imgur.com/u1KNU8z.png" width="118" alt="Apply"></a> | Oct 2015 |
 | RF-SMART | Software Developer Intern | Highlands Ranch, CO</br>Jacksonville, FL | 🔒 | Nov 24 |
+| Bandwidth Inc. | Software Engineer Intern | Raleigh, NC | 🔒 | Nov 24 |
+| ↳ | Software Engineer Intern | Raleigh, NC | 🔒 | Nov 24 |
+| ↳ | Software Engineer Intern | Raleigh, NC | 🔒 | Nov 24 |
 | Akuna Capital OCI | Quantitative Development & Strategy Intern | Chicago, IL | 🔒 | Nov 23 |
 | ↳ | Quantitative Research Intern | Chicago, IL | 🔒 | Nov 23 |
 | Renesas Electronics | Firmware Engineering Intern | Austin, TX | 🔒 | Nov 20 |
